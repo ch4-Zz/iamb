@@ -58,6 +58,36 @@ fn tag_name(name: String) -> Result<TagName, CommandError> {
     Ok(tag)
 }
 
+/// Take the rest of the command line as one filesystem path.
+///
+/// `CommandArgument::strings` treats `\` as a Vim escape, so Windows paths like
+/// `C:\Users\foo.png` fail at `\U`. Use the raw argument, strip matching quotes,
+/// and map `\` to `/` (accepted by `std::path` on Windows).
+fn command_fs_path(arg: &str) -> Result<String, CommandError> {
+    let raw = arg.trim();
+    if raw.is_empty() {
+        return Err(CommandError::InvalidArgument);
+    }
+
+    let unquoted = if raw.len() >= 2 {
+        let bytes = raw.as_bytes();
+        let quote = bytes[0];
+        if (quote == b'"' || quote == b'\'') && bytes[raw.len() - 1] == quote {
+            &raw[1..raw.len() - 1]
+        } else {
+            raw
+        }
+    } else {
+        raw
+    };
+
+    if unquoted.is_empty() {
+        return Err(CommandError::InvalidArgument);
+    }
+
+    Ok(unquoted.replace('\\', "/"))
+}
+
 fn iamb_invite(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     let args = desc.arg.strings()?;
 
@@ -669,13 +699,8 @@ fn iamb_space(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
 }
 
 fn iamb_upload(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
-    let mut args = desc.arg.strings()?;
-
-    if args.len() != 1 {
-        return Result::Err(CommandError::InvalidArgument);
-    }
-
-    let sact = SendAction::Upload(args.remove(0), None);
+    let path = command_fs_path(&desc.arg.text)?;
+    let sact = SendAction::Upload(path, None);
     let iact = IambAction::from(sact);
     let step = CommandStep::Continue(iact.into(), ctx.context.clone());
 
@@ -683,17 +708,17 @@ fn iamb_upload(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
 }
 
 fn iamb_download(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
-    let mut args = desc.arg.strings()?;
-
-    if args.len() > 1 {
-        return Result::Err(CommandError::InvalidArgument);
-    }
+    let dest = if desc.arg.text.trim().is_empty() {
+        None
+    } else {
+        Some(command_fs_path(&desc.arg.text)?)
+    };
 
     let mut flags = DownloadFlags::NONE;
     if desc.bang {
         flags |= DownloadFlags::FORCE;
     };
-    let mact = MessageAction::Download(args.pop(), flags);
+    let mact = MessageAction::Download(dest, flags);
     let iact = IambAction::from(mact);
     let step = CommandStep::Continue(iact.into(), ctx.context.clone());
 
@@ -701,17 +726,17 @@ fn iamb_download(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult 
 }
 
 fn iamb_open(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
-    let mut args = desc.arg.strings()?;
-
-    if args.len() > 1 {
-        return Result::Err(CommandError::InvalidArgument);
-    }
+    let dest = if desc.arg.text.trim().is_empty() {
+        None
+    } else {
+        Some(command_fs_path(&desc.arg.text)?)
+    };
 
     let mut flags = DownloadFlags::OPEN;
     if desc.bang {
         flags |= DownloadFlags::FORCE;
     };
-    let mact = MessageAction::Download(args.pop(), flags);
+    let mact = MessageAction::Download(dest, flags);
     let iact = IambAction::from(mact);
     let step = CommandStep::Continue(iact.into(), ctx.context.clone());
 
@@ -1459,5 +1484,47 @@ mod tests {
 
         let res = cmds.input_cmd("keys import foo bar baz", ctx.clone());
         assert_eq!(res, Err(CommandError::InvalidArgument));
+    }
+
+    #[test]
+    fn test_cmd_upload_windows_path() {
+        let mut cmds = setup_commands();
+        let ctx = EditContext::default();
+
+        let res = cmds.input_cmd(r":upload C:\Users\vangy\Pictures\foo.png", ctx.clone()).unwrap();
+        let act = IambAction::from(SendAction::Upload(
+            "C:/Users/vangy/Pictures/foo.png".into(),
+            None,
+        ));
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        let res = cmds
+            .input_cmd(r#":upload "C:\Users\My Pictures\foo.png""#, ctx.clone())
+            .unwrap();
+        let act = IambAction::from(SendAction::Upload(
+            "C:/Users/My Pictures/foo.png".into(),
+            None,
+        ));
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        let res = cmds.input_cmd(":upload C:/already/forward.png", ctx.clone()).unwrap();
+        let act = IambAction::from(SendAction::Upload("C:/already/forward.png".into(), None));
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
+        let res = cmds.input_cmd(":upload", ctx.clone());
+        assert_eq!(res, Err(CommandError::InvalidArgument));
+    }
+
+    #[test]
+    fn test_command_fs_path() {
+        assert_eq!(
+            command_fs_path(r"C:\Users\vangy\Pictures\foo.png").unwrap(),
+            "C:/Users/vangy/Pictures/foo.png"
+        );
+        assert_eq!(
+            command_fs_path(r#" "C:\Users\My Pictures\foo.png" "#).unwrap(),
+            "C:/Users/My Pictures/foo.png"
+        );
+        assert_eq!(command_fs_path("").unwrap_err(), CommandError::InvalidArgument);
     }
 }
