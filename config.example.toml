@@ -41,6 +41,12 @@ headers.X-Proxy-Config = "foobar"
 rooms = ["favorite", "lowpriority", "unread", "name"]
 members = ["power", "id"]
 
+[settings.list_colors]
+mention = "light-red"
+unread = "light-yellow"
+dm = "cyan"
+room = "gray"
+
 [settings.terminal]
 cursor_shape = "default"
 enable_extended_keys = false

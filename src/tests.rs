@@ -181,6 +181,7 @@ pub fn mock_tunables() -> TunableValues {
         read_receipt_display: true,
         request_timeout: 120,
         sort: SortOverrides::default().values(),
+        list_colors: ListColorValues::default(),
         state_event_display: true,
         terminal: Terminal::default().values(),
         typing_notice_send: true,

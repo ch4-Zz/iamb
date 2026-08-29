@@ -407,7 +407,7 @@ pub enum EncryptionIndicator {
 
 bitflags::bitflags! {
     /// Available options for where to show the encryption status indicator.
-    #[derive(Clone, Debug, Eq, PartialEq)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct EncryptionIndicatorLocation: u8 {
         const NONE   = 0b00000000;
         const TITLE  = 0b00000001;
@@ -586,15 +586,23 @@ impl EncryptionValues {
                 EncryptionIndicator::Enabled | EncryptionIndicator::OnlyEncrypted,
                 EncryptionState::Encrypted,
             ) => {
-                // Green lock:
-                Span::styled("\u{1F512}\u{FE0E} ", Style::new().fg(Color::LightGreen))
+                // Prompt must stay ASCII: WT draws U+1F512 two cells wide while
+                // unicode-width often counts 1, which leaves ghost glyphs while typing.
+                if location.contains(EncryptionIndicatorLocation::PROMPT) {
+                    Span::styled("> ", Style::new().fg(Color::LightGreen))
+                } else {
+                    Span::styled("\u{1F512}\u{FE0E} ", Style::new().fg(Color::LightGreen))
+                }
             },
             (
                 EncryptionIndicator::Enabled | EncryptionIndicator::OnlyUnencrypted,
                 EncryptionState::NotEncrypted,
             ) => {
-                // Red unlocked lock:
-                Span::styled("\u{1F513}\u{FE0E} ", Style::new().fg(Color::Red))
+                if location.contains(EncryptionIndicatorLocation::PROMPT) {
+                    Span::styled("> ", Style::new().fg(Color::Red))
+                } else {
+                    Span::styled("\u{1F513}\u{FE0E} ", Style::new().fg(Color::Red))
+                }
             },
 
             (_, EncryptionState::Unknown) => {
@@ -802,6 +810,45 @@ pub struct TerminalValues {
     pub enable_title: bool,
 }
 
+/// Optional colours for room/chat list rows (`:chats`, `:rooms`, `:dms`, `:unreads`).
+///
+/// Absent fields keep the default (no foreground colour).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ListColorValues {
+    pub mention: Option<Color>,
+    pub unread: Option<Color>,
+    pub dm: Option<Color>,
+    pub room: Option<Color>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct ListColors {
+    pub mention: Option<UserColor>,
+    pub unread: Option<UserColor>,
+    pub dm: Option<UserColor>,
+    pub room: Option<UserColor>,
+}
+
+impl ListColors {
+    fn merge(profile: Self, global: Self) -> Self {
+        Self {
+            mention: profile.mention.or(global.mention),
+            unread: profile.unread.or(global.unread),
+            dm: profile.dm.or(global.dm),
+            room: profile.room.or(global.room),
+        }
+    }
+
+    pub fn values(self) -> ListColorValues {
+        ListColorValues {
+            mention: self.mention.map(|c| c.0),
+            unread: self.unread.map(|c| c.0),
+            dm: self.dm.map(|c| c.0),
+            room: self.room.map(|c| c.0),
+        }
+    }
+}
+
 /// The configuration settings to run with, after merging the
 /// per-profile overrides on top of the global settings.
 #[derive(Clone)]
@@ -820,6 +867,7 @@ pub struct TunableValues {
     pub read_receipt_display: bool,
     pub request_timeout: u64,
     pub sort: SortValues,
+    pub list_colors: ListColorValues,
     pub state_event_display: bool,
     pub typing_notice_send: bool,
     pub typing_notice_display: bool,
@@ -857,6 +905,10 @@ pub struct Tunables {
     /// Subsection for overriding terminal settings.
     #[serde(default)]
     pub terminal: Terminal,
+
+    /// Subsection for colouring room/chat list rows.
+    #[serde(default)]
+    pub list_colors: ListColors,
 
     /// Subsection for overriding how specific Matrix users are rendered.
     pub users: Option<UserOverrides>,
@@ -897,6 +949,7 @@ impl Tunables {
             encryption: Encryption::merge(self.encryption, other.encryption),
             sort: SortOverrides::merge(self.sort, other.sort),
             terminal: Terminal::merge(self.terminal, other.terminal),
+            list_colors: ListColors::merge(self.list_colors, other.list_colors),
             users: merge_maps(self.users, other.users),
 
             // Proxy configuration sub-field do *not* get merged, so that a
@@ -947,6 +1000,7 @@ impl Tunables {
             proxy: self.proxy.unwrap_or_default().values(),
             sort: self.sort.values(),
             terminal: self.terminal.values(),
+            list_colors: self.list_colors.values(),
             users: self.users.unwrap_or_default(),
 
             default_markup: self.default_markup.unwrap_or_default(),
@@ -1504,6 +1558,16 @@ mod tests {
         assert_eq!(res.typing_notice_send, None);
         assert_eq!(res.typing_notice_display, None);
         assert_eq!(res.users, Some(HashMap::new()));
+        assert_eq!(res.list_colors, ListColors::default());
+
+        let res: Tunables = serde_json::from_str(
+            "{\"list_colors\": {\"mention\": \"light-red\", \"unread\": \"light-yellow\", \"dm\": \"cyan\", \"room\": \"gray\"}}",
+        )
+        .unwrap();
+        assert_eq!(res.list_colors.mention, Some(UserColor(Color::LightRed)));
+        assert_eq!(res.list_colors.unread, Some(UserColor(Color::LightYellow)));
+        assert_eq!(res.list_colors.dm, Some(UserColor(Color::Cyan)));
+        assert_eq!(res.list_colors.room, Some(UserColor(Color::Gray)));
 
         let res: Tunables = serde_json::from_str(
             "{\"users\": {\"@a:b.c\": {\"color\": \"black\", \"name\": \"Tim\"}}}",

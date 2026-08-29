@@ -78,6 +78,7 @@ use crate::base::{
     SpaceAction,
     UnreadInfo,
 };
+use crate::config::ListColorValues;
 use crate::windows::room::room_command;
 
 use self::{room::RoomState, welcome::WelcomeState};
@@ -125,26 +126,42 @@ fn selected_text(s: &str, selected: bool) -> Text<'_> {
     Text::from(selected_span(s, selected))
 }
 
+#[inline]
+fn with_fg(style: Style, color: Option<Color>) -> Style {
+    match color {
+        Some(color) => style.fg(color),
+        None => style,
+    }
+}
+
 fn name_and_labels<'a>(
     name: &'a str,
     unread: &UnreadInfo,
     style: Style,
+    colors: &ListColorValues,
 ) -> (Span<'a>, Vec<Vec<Span<'static>>>) {
-    // TODO: use different colors for "mention", "notification", "muted room"
-    let name_style = if unread.is_unread() {
-        style.add_modifier(StyleModifier::BOLD)
+    let unread_color = if unread.has_mention() {
+        colors.mention
+    } else if unread.is_unread() {
+        colors.unread
     } else {
-        style
+        None
     };
+
+    let mut name_style = style;
+    if unread.is_unread() {
+        name_style = name_style.add_modifier(StyleModifier::BOLD);
+    }
+    name_style = with_fg(name_style, unread_color);
 
     let name = Span::styled(name, name_style);
 
     let mut labels = vec![];
 
-    if unread.unread_mentions > 0 {
-        labels.push(vec![Span::styled("Unread Mention", style)]);
+    if unread.has_mention() {
+        labels.push(vec![Span::styled("Unread Mention", with_fg(style, colors.mention))]);
     } else if unread.is_unread() {
-        labels.push(vec![Span::styled("Unread", style)]);
+        labels.push(vec![Span::styled("Unread", with_fg(style, colors.unread))]);
     }
 
     (name, labels)
@@ -1045,17 +1062,16 @@ impl ListItem<IambInfo> for GenericChatItem {
         &self,
         selected: bool,
         _: &ViewportContext<ListCursor>,
-        _: &mut ProgramStore,
+        store: &mut ProgramStore,
     ) -> Text<'_> {
         let style = selected_style(selected);
-        let (name, mut labels) = name_and_labels(&self.name, &self.unread, style);
+        let colors = store.application.settings.tunables.list_colors;
+        let (name, mut labels) = name_and_labels(&self.name, &self.unread, style, &colors);
         let mut spans = vec![name];
 
-        labels.push(if self.is_dm {
-            vec![Span::styled("DM", style)]
-        } else {
-            vec![Span::styled("Room", style)]
-        });
+        if self.is_dm {
+            labels.push(vec![Span::styled("DM", with_fg(style, colors.dm))]);
+        }
 
         if let Some(tags) = &self.tags() {
             labels.extend(tags.keys().map(|t| tag_to_span(t, style)));
@@ -1163,10 +1179,11 @@ impl ListItem<IambInfo> for RoomItem {
         &self,
         selected: bool,
         _: &ViewportContext<ListCursor>,
-        _: &mut ProgramStore,
+        store: &mut ProgramStore,
     ) -> Text<'_> {
         let style = selected_style(selected);
-        let (name, mut labels) = name_and_labels(&self.name, &self.unread, style);
+        let colors = store.application.settings.tunables.list_colors;
+        let (name, mut labels) = name_and_labels(&self.name, &self.unread, style, &colors);
         let mut spans = vec![name];
 
         if let Some(tags) = &self.tags() {
@@ -1272,10 +1289,11 @@ impl ListItem<IambInfo> for DirectItem {
         &self,
         selected: bool,
         _: &ViewportContext<ListCursor>,
-        _: &mut ProgramStore,
+        store: &mut ProgramStore,
     ) -> Text<'_> {
         let style = selected_style(selected);
-        let (name, mut labels) = name_and_labels(&self.name, &self.unread, style);
+        let colors = store.application.settings.tunables.list_colors;
+        let (name, mut labels) = name_and_labels(&self.name, &self.unread, style, &colors);
         let mut spans = vec![name];
 
         if let Some(tags) = &self.tags() {
@@ -2039,5 +2057,89 @@ mod tests {
         ];
         rooms.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
         assert_eq!(rooms, vec![&room5, &room1, &room3, &room4, &room2]);
+    }
+
+    fn unread_info(notifications: u64, mentions: u64) -> UnreadInfo {
+        UnreadInfo {
+            unread_mark: false,
+            unread_messages: 0,
+            unread_notifications: notifications,
+            unread_mentions: mentions,
+            latest: None,
+        }
+    }
+
+    #[test]
+    fn test_name_and_labels_read() {
+        let colors = ListColorValues {
+            mention: Some(Color::LightRed),
+            unread: Some(Color::LightYellow),
+            ..Default::default()
+        };
+        let (name, labels) =
+            name_and_labels("hello", &unread_info(0, 0), Style::default(), &colors);
+        assert_eq!(name, Span::raw("hello"));
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn test_name_and_labels_unread() {
+        let colors = ListColorValues {
+            mention: Some(Color::LightRed),
+            unread: Some(Color::LightYellow),
+            ..Default::default()
+        };
+        let style = Style::default();
+        let (name, labels) = name_and_labels("hello", &unread_info(1, 0), style, &colors);
+        assert_eq!(
+            name,
+            Span::styled(
+                "hello",
+                style.fg(Color::LightYellow).add_modifier(StyleModifier::BOLD)
+            )
+        );
+        assert_eq!(labels, vec![vec![Span::styled("Unread", style.fg(Color::LightYellow))]]);
+    }
+
+    #[test]
+    fn test_name_and_labels_mention_beats_unread() {
+        let colors = ListColorValues {
+            mention: Some(Color::LightRed),
+            unread: Some(Color::LightYellow),
+            ..Default::default()
+        };
+        let style = Style::default();
+        let (name, labels) = name_and_labels("hello", &unread_info(3, 1), style, &colors);
+        assert_eq!(
+            name,
+            Span::styled("hello", style.fg(Color::LightRed).add_modifier(StyleModifier::BOLD))
+        );
+        assert_eq!(
+            labels,
+            vec![vec![Span::styled("Unread Mention", style.fg(Color::LightRed))]]
+        );
+    }
+
+    #[test]
+    fn test_name_and_labels_selected_keeps_reverse() {
+        let colors = ListColorValues { unread: Some(Color::LightYellow), ..Default::default() };
+        let style = selected_style(true);
+        let (name, _) = name_and_labels("hello", &unread_info(1, 0), style, &colors);
+        assert_eq!(
+            name,
+            Span::styled(
+                "hello",
+                style.fg(Color::LightYellow).add_modifier(StyleModifier::BOLD)
+            )
+        );
+        assert!(name.style.add_modifier.contains(StyleModifier::REVERSED));
+    }
+
+    #[test]
+    fn test_name_and_labels_without_config_stays_bold_only() {
+        let (name, labels) =
+            name_and_labels("hello", &unread_info(1, 0), Style::default(), &ListColorValues::default());
+        assert_eq!(name, Span::styled("hello", Style::default().add_modifier(StyleModifier::BOLD)));
+        assert_eq!(labels, vec![vec![Span::styled("Unread", Style::default())]]);
     }
 }

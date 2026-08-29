@@ -192,6 +192,36 @@ and
 An optional list of two numbers representing font width and height in pixels.
 .El
 .El
+.It Sy list_colors
+When this subsection is present, you can colour names and labels in the
+.Sy :chats ,
+.Sy :rooms ,
+.Sy :dms ,
+and
+.Sy :unreads
+windows.
+Each field is an optional colour name
+.Po
+the same values as
+.Sx USER OVERRIDES
+.Pc :
+.Bl -tag -width Ds
+.It Sy mention
+Colour for rooms with unread mentions.
+.It Sy unread
+Colour for rooms with unread notifications.
+.It Sy dm
+Colour for the
+.Dq DM
+label in
+.Sy :chats .
+.It Sy room
+Colour for the
+.Dq Room
+label in
+.Sy :chats .
+.El
+Unset fields keep the default (no extra foreground colour; unread names stay bold).
 .It Sy log_level
 Specifies the lowest log level that should be shown.
 Possible values are:

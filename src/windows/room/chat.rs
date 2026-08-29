@@ -1162,6 +1162,13 @@ impl StatefulWidget for Chat<'_> {
             (true, None) => Span::raw("> "),
         };
 
+        // Clear the bar first so a width-mismatched prompt cannot leave stale cells.
+        for y in textarea.top()..textarea.bottom() {
+            for x in textarea.left()..textarea.right() {
+                buf[(x, y)].reset();
+            }
+        }
+
         let tbox = TextBox::new().prompt(prompt);
         tbox.render(textarea, buf, &mut state.tbox);
 
