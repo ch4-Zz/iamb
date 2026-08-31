@@ -70,12 +70,13 @@ const DEFAULT_LOG_LEVEL: &str = if cfg!(feature = "max_level_error") {
     "warn"
 };
 
-const COLORS: [Color; 13] = [
+// Green and LightGreen are deliberately excluded: settings.users pins my own
+// name to green, and the hash pool must never hand it to somebody else.
+// Override a specific user via settings.users if you want green back for them.
+const COLORS: [Color; 11] = [
     Color::Blue,
     Color::Cyan,
-    Color::Green,
     Color::LightBlue,
-    Color::LightGreen,
     Color::LightCyan,
     Color::LightMagenta,
     Color::LightRed,
@@ -1941,5 +1942,14 @@ mod tests {
         // But is hidden when encrypted:
         assert!(enc.get_indicator(EncryptionIndicatorLocation::TITLE, Encrypted).is_none());
         assert!(enc.get_indicator(EncryptionIndicatorLocation::PROMPT, Encrypted).is_none());
+    }
+
+    #[test]
+    fn test_user_colors_exclude_green() {
+        // Green is reserved for the local user, pinned through settings.users.
+        // If an upstream merge puts either shade back into the pool, fail here
+        // rather than silently handing green to somebody else.
+        assert!(!COLORS.contains(&Color::Green));
+        assert!(!COLORS.contains(&Color::LightGreen));
     }
 }
