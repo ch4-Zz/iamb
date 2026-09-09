@@ -1408,23 +1408,16 @@ impl ApplicationSettings {
         Ok(())
     }
 
-    pub fn get_user_char_span(&self, user_id: &UserId) -> Span<'_> {
-        let (color, c) = self
-            .tunables
-            .users
-            .get(user_id)
-            .map(|user| {
-                (
-                    user.color.as_ref().map(|c| c.0),
-                    user.name.as_ref().and_then(|s| s.chars().next()),
-                )
-            })
-            .unwrap_or_default();
-
+    pub fn get_user_char_span(&self, user_id: &UserId, info: &RoomInfo) -> Span<'static> {
+        let (color, name) = self.get_user_overrides(user_id);
         let color = color.unwrap_or_else(|| user_color(user_id.as_str()));
         let style = user_style_from_color(color);
 
-        let c = c.unwrap_or_else(|| user_id.localpart().chars().next().unwrap_or(' '));
+        let c = name
+            .as_deref()
+            .and_then(|name| name.chars().next())
+            .or_else(|| info.display_names.get(user_id).and_then(|name| name.chars().next()))
+            .unwrap_or_else(|| user_id.localpart().chars().next().unwrap_or(' '));
 
         Span::styled(String::from(c), style)
     }
@@ -1477,8 +1470,41 @@ impl ApplicationSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::{TEST_USER1, TEST_USER5, mock_room, mock_settings};
     use matrix_sdk::ruma::user_id;
     use std::convert::TryFrom;
+
+    #[test]
+    fn test_user_char_uses_display_name() {
+        let settings = mock_settings();
+        let mut info = mock_room();
+        info.display_names.set(TEST_USER1.clone(), Some("Camille Aubry".into()));
+
+        let span = settings.get_user_char_span(&TEST_USER1, &info);
+
+        assert_eq!(span.content.as_ref(), "C");
+    }
+
+    #[test]
+    fn test_user_char_prefers_configured_name() {
+        let settings = mock_settings();
+        let mut info = mock_room();
+        info.display_names.set(TEST_USER5.clone(), Some("Camille Aubry".into()));
+
+        let span = settings.get_user_char_span(&TEST_USER5, &info);
+
+        assert_eq!(span.content.as_ref(), "U");
+    }
+
+    #[test]
+    fn test_user_char_falls_back_to_localpart() {
+        let settings = mock_settings();
+        let info = mock_room();
+
+        let span = settings.get_user_char_span(&TEST_USER1, &info);
+
+        assert_eq!(span.content.as_ref(), "u");
+    }
 
     #[test]
     fn test_profile_name_invalid() {

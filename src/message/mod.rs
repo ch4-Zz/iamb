@@ -703,8 +703,8 @@ struct MessageFormatter<'a> {
     /// The date the message was sent.
     date: Option<Span<'a>>,
 
-    /// The users who have read up to this message.
-    read: Vec<OwnedUserId>,
+    /// The user initials for those who have read up to this message.
+    read: Vec<Span<'static>>,
 }
 
 impl<'a> MessageFormatter<'a> {
@@ -751,19 +751,15 @@ impl<'a> MessageFormatter<'a> {
 
         match self.cols {
             MessageColumns::Four => {
-                let settings = self.settings;
                 let time = self.time.take().unwrap_or(TIME_GUTTER_EMPTY_SPAN);
 
                 let mut line = vec![user_gutter];
                 line.extend(prev_line.spans);
                 line.push(time);
 
-                // Show read receipts.
-                let user_char = |user: OwnedUserId| -> Span { settings.get_user_char_span(&user) };
-
-                let a = self.read.pop().map(user_char).unwrap_or_else(|| Span::raw(" "));
-                let b = self.read.pop().map(user_char).unwrap_or_else(|| Span::raw(" "));
-                let c = self.read.pop().map(user_char).unwrap_or_else(|| Span::raw(" "));
+                let a = self.read.pop().unwrap_or_else(|| Span::raw(" "));
+                let b = self.read.pop().unwrap_or_else(|| Span::raw(" "));
+                let c = self.read.pop().unwrap_or_else(|| Span::raw(" "));
 
                 line.push(Span::raw(" "));
                 line.push(c);
@@ -1065,7 +1061,7 @@ impl Message {
                 .values()
                 .filter_map(|receipts| self.event.event_id().and_then(|id| receipts.get(id)))
                 .flat_map(|read| read.iter())
-                .map(|user_id| user_id.to_owned())
+                .map(|user_id| settings.get_user_char_span(user_id, info))
                 .collect();
 
             MessageFormatter { settings, cols, orig, fill, user, date, time, read }
