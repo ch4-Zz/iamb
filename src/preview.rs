@@ -3,31 +3,23 @@ use std::{collections::HashMap, sync::Arc};
 use matrix_sdk::{
     Media,
     media::{MediaFormat, MediaRequestParameters, UniqueKey},
-    ruma::{
-        OwnedEventId,
-        events::{
-            MessageLikeEvent,
-            room::{
-                MediaSource,
-                message::{MessageType, RoomMessageEventContent},
-            },
-        },
-    },
+    ruma::events::room::MediaSource,
 };
-use ratatui::layout::Rect;
-use ratatui_image::{Resize, picker::Picker, protocol::Protocol};
+use ratatui::layout::Size;
+use ratatui_image::sliced::SlicedProtocol;
+use ratatui_image::{FilterType, Resize, picker::Picker};
 use tokio::sync::Semaphore;
 
 use crate::{
     base::{AsyncProgramStore, IambError},
-    config::{ApplicationSettings, ImagePreviewSize},
+    config::{ApplicationSettings, ImagePreviewValues},
     worker::Requester,
 };
 
 pub enum ImageStatus {
-    Queued(ImagePreviewSize),
-    Downloading(ImagePreviewSize),
-    Loaded(Protocol),
+    Queued(Size),
+    Downloading(Size),
+    Loaded(SlicedProtocol),
     Error(String),
 }
 
@@ -37,9 +29,18 @@ pub enum PreviewKind {
     Reaction,
 }
 
+impl PreviewKind {
+    fn image_size(self, image_preview: &ImagePreviewValues) -> Size {
+        match self {
+            Self::Message => image_preview.size,
+            Self::Reaction => Size { width: 2, height: 1 },
+        }
+    }
+}
+
 pub struct PreviewManager {
     /// Image preview "protocol" picker.
-    picker: Option<Arc<Picker>>,
+    picker: Arc<Picker>,
 
     /// Permits for rendering images in background thread.
     permits: Arc<Semaphore>,
@@ -49,9 +50,11 @@ pub struct PreviewManager {
 }
 
 impl PreviewManager {
-    pub fn new(picker: Option<Picker>) -> Self {
+    pub fn new(settings: &ApplicationSettings) -> Self {
+        let picker = picker_from_settings(settings);
+
         Self {
-            picker: picker.map(Into::into),
+            picker: picker.into(),
             permits: Arc::new(Semaphore::new(2)),
             previews: Default::default(),
         }
@@ -70,7 +73,6 @@ impl PreviewManager {
         let Some(status) = self.previews.get_mut(&(source.unique_key(), kind)) else {
             return;
         };
-        let Some(picker) = &self.picker else { return };
 
         if let ImageStatus::Queued(size) = status {
             let size = *size;
@@ -80,7 +82,7 @@ impl PreviewManager {
                 source.to_owned(),
                 kind,
                 size.to_owned(),
-                Arc::clone(picker),
+                Arc::clone(&self.picker),
                 Arc::clone(&self.permits),
             );
         }
@@ -89,52 +91,49 @@ impl PreviewManager {
     pub fn register_preview(
         &mut self,
         settings: &ApplicationSettings,
-        source: MediaSource,
+        source: &MediaSource,
         kind: PreviewKind,
-        size: ImagePreviewSize,
         worker: &Requester,
     ) {
-        if self.picker.is_none() {
-            return;
-        }
-
         let key = (source.unique_key(), kind);
         if self.previews.contains_key(&key) {
             return;
         }
+
+        let size = kind.image_size(&settings.tunables.image_preview);
         self.previews.insert(key, ImageStatus::Queued(size));
 
-        if settings
-            .tunables
-            .image_preview
-            .as_ref()
-            .is_some_and(|setting| !setting.lazy_load)
-        {
-            self.load(&source, kind, worker);
+        if settings.tunables.image_preview.enabled && !settings.tunables.image_preview.lazy_load {
+            self.load(source, kind, worker);
         }
     }
 }
 
-pub fn source_from_event(
-    ev: &MessageLikeEvent<RoomMessageEventContent>,
-) -> Option<(OwnedEventId, MediaSource)> {
-    if let MessageLikeEvent::Original(ev) = &ev &&
-        let MessageType::Image(c) = &ev.content.msgtype
-    {
-        return Some((ev.event_id.clone(), c.source.clone()));
-    }
-    None
+fn picker_from_query() -> Picker {
+    // XXX: documentation says to use this query on alternate screen but it seems to be fine
+    Picker::from_query_stdio().unwrap_or_else(|e| {
+        tracing::warn!("Failed to setup image previews (falling back to halfblock rendering): {e}");
+        Picker::halfblocks()
+    })
 }
 
-impl From<ImagePreviewSize> for Rect {
-    fn from(value: ImagePreviewSize) -> Self {
-        Rect::new(0, 0, value.width as _, value.height as _)
+fn picker_from_settings(settings: &ApplicationSettings) -> Picker {
+    let mut picker = if !settings.tunables.image_preview.enabled {
+        // Skip any auto-detection and use halfblocks when disabled:
+        Picker::halfblocks()
+    } else if let Some(font_size) = settings.tunables.image_preview.protocol.font_size {
+        #[expect(deprecated, reason = "from_query_stdio doesn't work on windows")]
+        Picker::from_fontsize(font_size.into())
+    } else {
+        picker_from_query()
+    };
+
+    // user forced protocol type; use that
+    if let Some(protocol_type) = settings.tunables.image_preview.protocol.r#type {
+        picker.set_protocol_type(protocol_type);
     }
-}
-impl From<Rect> for ImagePreviewSize {
-    fn from(rect: Rect) -> Self {
-        ImagePreviewSize { width: rect.width as _, height: rect.height as _ }
-    }
+
+    picker
 }
 
 pub async fn load_image(
@@ -144,14 +143,15 @@ pub async fn load_image(
     kind: PreviewKind,
     picker: Arc<Picker>,
     permits: Arc<Semaphore>,
-    size: ImagePreviewSize,
+    size: Size,
 ) {
     async fn load_image_inner(
         media: Media,
         source: MediaSource,
         picker: Arc<Picker>,
         permits: Arc<Semaphore>,
-        size: ImagePreviewSize,
+        size: Size,
+        filter: FilterType,
     ) -> Result<ImageStatus, IambError> {
         let reader = media
             .get_media_content(&MediaRequestParameters { source, format: MediaFormat::File }, true)
@@ -161,16 +161,15 @@ pub async fn load_image(
             .map_err(IambError::Matrix)
             .and_then(|reader| reader.with_guessed_format().map_err(IambError::IOError))?;
 
-        let image = reader.decode().map_err(IambError::Image)?;
-
         let permit = permits
             .acquire()
             .await
             .map_err(|err| IambError::Preview(err.to_string()))?;
 
         let handle = tokio::task::spawn_blocking(move || {
-            picker
-                .new_protocol(image, size.into(), Resize::Fit(None))
+            let image = reader.decode().map_err(IambError::Image)?;
+
+            SlicedProtocol::new_with_resize(&picker, image, size, Resize::Fit(Some(filter)))
                 .map_err(|err| IambError::Preview(err.to_string()))
         });
 
@@ -181,7 +180,18 @@ pub async fn load_image(
     }
     let key = source.unique_key();
 
-    let status = match load_image_inner(media, source, picker, permits, size).await {
+    let filter = store
+        .lock()
+        .await
+        .application
+        .settings
+        .tunables
+        .image_preview
+        .protocol
+        .filter
+        .unwrap_or(FilterType::Triangle);
+
+    let status = match load_image_inner(media, source, picker, permits, size, filter).await {
         Ok(status) => status,
         Err(err) => ImageStatus::Error(format!("{err:?}")),
     };

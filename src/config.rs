@@ -17,8 +17,10 @@ use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::media::MediaRetentionPolicy;
 use matrix_sdk::reqwest::header::{HeaderMap, HeaderValue};
 use matrix_sdk::ruma::{OwnedDeviceId, OwnedRoomAliasId, OwnedRoomId, OwnedUserId, UserId};
+use ratatui::layout::Size;
 use ratatui::style::{Color, Modifier as StyleModifier, Style};
 use ratatui::text::Span;
+use ratatui_image::FilterType;
 use ratatui_image::picker::ProtocolType;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as SerdeError, de::Visitor};
 use url::Url;
@@ -47,8 +49,10 @@ macro_rules! usage {
     }
 }
 
-const DEFAULT_MEMBERS_SORT: [SortColumn<SortFieldUser>; 2] = [
+const DEFAULT_MEMBERS_SORT: [SortColumn<SortFieldUser>; 4] = [
     SortColumn(SortFieldUser::PowerLevel, SortOrder::Ascending),
+    SortColumn(SortFieldUser::Knock, SortOrder::Ascending),
+    SortColumn(SortFieldUser::Invite, SortOrder::Descending),
     SortColumn(SortFieldUser::UserId, SortOrder::Ascending),
 ];
 
@@ -699,43 +703,35 @@ pub struct Notifications {
 
 #[derive(Clone)]
 pub struct ImagePreviewValues {
+    pub enabled: bool,
     pub lazy_load: bool,
-    pub size: ImagePreviewSize,
-    pub protocol: Option<ImagePreviewProtocolValues>,
+    pub size: Size,
+    pub protocol: ImagePreviewProtocolValues,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct ImagePreview {
+    pub enabled: Option<bool>,
     pub lazy_load: Option<bool>,
-    pub size: Option<ImagePreviewSize>,
+    pub size: Option<Size>,
     pub protocol: Option<ImagePreviewProtocolValues>,
 }
 
 impl ImagePreview {
-    fn values(self) -> ImagePreviewValues {
+    pub fn values(self) -> ImagePreviewValues {
         ImagePreviewValues {
+            enabled: self.enabled.unwrap_or(true),
             lazy_load: self.lazy_load.unwrap_or(true),
-            size: self.size.unwrap_or_default(),
-            protocol: self.protocol,
+            size: self.size.unwrap_or(Size { width: 66, height: 10 }),
+            protocol: self.protocol.unwrap_or_default(),
         }
     }
 }
 
-#[derive(Clone, Copy, Deserialize, Debug)]
-pub struct ImagePreviewSize {
-    pub width: usize,
-    pub height: usize,
-}
-
-impl Default for ImagePreviewSize {
-    fn default() -> Self {
-        ImagePreviewSize { width: 66, height: 10 }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Default)]
 pub struct ImagePreviewProtocolValues {
     pub r#type: Option<ProtocolType>,
+    pub filter: Option<FilterType>,
     pub font_size: Option<(u16, u16)>,
 }
 
@@ -856,6 +852,7 @@ impl ListColors {
 pub struct TunableValues {
     pub encryption: EncryptionValues,
     pub default_markup: MarkupFormat,
+    pub ignorecase: bool,
     pub log_level: String,
     pub max_log_files: usize,
     pub message_shortcode_display: bool,
@@ -880,10 +877,11 @@ pub struct TunableValues {
     pub mouse: Mouse,
     pub notifications: Notifications,
     pub terminal: TerminalValues,
-    pub image_preview: Option<ImagePreviewValues>,
+    pub image_preview: ImagePreviewValues,
     pub user_gutter_width: usize,
     pub external_edit_file_suffix: String,
     pub tabstop: usize,
+    pub input_prompt: Option<String>,
     pub members_split: Option<SplitDirection>,
     pub default_split: SplitDirection,
     pub ssl_verify: bool,
@@ -915,6 +913,7 @@ pub struct Tunables {
     pub users: Option<UserOverrides>,
 
     pub default_markup: Option<MarkupFormat>,
+    pub ignorecase: Option<bool>,
     pub log_level: Option<String>,
     pub max_log_files: Option<usize>,
     pub message_shortcode_display: Option<bool>,
@@ -938,6 +937,7 @@ pub struct Tunables {
     pub user_gutter_width: Option<usize>,
     pub external_edit_file_suffix: Option<String>,
     pub tabstop: Option<usize>,
+    pub input_prompt: Option<String>,
     pub members_split: Option<SplitDirection>,
     pub default_split: Option<SplitDirection>,
     pub ssl_verify: Option<bool>,
@@ -959,6 +959,7 @@ impl Tunables {
             proxy: self.proxy.or(other.proxy),
 
             default_markup: self.default_markup.or(other.default_markup),
+            ignorecase: self.ignorecase.or(other.ignorecase),
             log_level: self.log_level.or(other.log_level),
             max_log_files: self.max_log_files.or(other.max_log_files),
             message_shortcode_display: self
@@ -988,6 +989,7 @@ impl Tunables {
                 .external_edit_file_suffix
                 .or(other.external_edit_file_suffix),
             tabstop: self.tabstop.or(other.tabstop),
+            input_prompt: self.input_prompt.or(other.input_prompt),
             members_split: self.members_split.or(other.members_split),
             default_split: self.default_split.or(other.default_split),
             ssl_verify: self.ssl_verify.or(other.ssl_verify),
@@ -1006,6 +1008,7 @@ impl Tunables {
 
             default_markup: self.default_markup.unwrap_or_default(),
             log_level: self.log_level.unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_owned()),
+            ignorecase: self.ignorecase.unwrap_or(false),
             max_log_files: self.max_log_files.unwrap_or(7),
             message_shortcode_display: self.message_shortcode_display.unwrap_or(false),
             normal_after_send: self.normal_after_send.unwrap_or(false),
@@ -1024,12 +1027,13 @@ impl Tunables {
             open_command: self.open_command,
             mouse: self.mouse.unwrap_or_default(),
             notifications: self.notifications.unwrap_or_default(),
-            image_preview: self.image_preview.map(ImagePreview::values),
+            image_preview: self.image_preview.unwrap_or_default().values(),
             user_gutter_width: self.user_gutter_width.unwrap_or(30),
             external_edit_file_suffix: self
                 .external_edit_file_suffix
                 .unwrap_or_else(|| ".md".to_string()),
             tabstop: self.tabstop.unwrap_or(4),
+            input_prompt: self.input_prompt,
             members_split: self.members_split,
             default_split: self.default_split.unwrap_or_default(),
             ssl_verify: self.ssl_verify.unwrap_or(true),

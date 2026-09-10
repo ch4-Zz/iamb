@@ -7,24 +7,20 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fmt::{self, Display};
 use std::hash::Hash;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use emojis::Emoji;
 
-use matrix_sdk::ruma::OwnedMxcUri;
-use matrix_sdk::ruma::OwnedTransactionId;
-use matrix_sdk::ruma::events::receipt::ReceiptThread;
-use matrix_sdk::ruma::events::room::MediaSource;
-use matrix_sdk::ruma::events::sticker::StickerEvent;
+use matrix_sdk::Client;
+use matrix_sdk::encryption::verification::VerificationRequest;
+use matrix_sdk::ruma::room::{AllowRule, Restricted};
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Rect},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
-use ratatui_image::picker::{Picker, ProtocolType};
 use serde::{
     Deserialize,
     Deserializer,
@@ -38,22 +34,30 @@ use url::Url;
 
 use matrix_sdk::{
     RoomState as MatrixRoomState,
-    encryption::verification::SasVerification,
     room::Room as MatrixRoom,
     ruma::{
         EventId,
         OwnedEventId,
+        OwnedMxcUri,
+        OwnedRoomAliasId,
         OwnedRoomId,
+        OwnedRoomOrAliasId,
+        OwnedTransactionId,
         OwnedUserId,
         RoomId,
+        RoomVersionId,
         UserId,
         events::{
             AnySyncStateEvent,
             MessageLikeEvent,
+            OriginalMessageLikeEvent,
             reaction::ReactionEvent,
+            receipt::ReceiptThread,
             relation::{Replacement, Thread},
+            room::MediaSource,
             room::encrypted::RoomEncryptedEvent,
             room::message::{
+                MessageType,
                 OriginalRoomMessageEvent,
                 Relation,
                 RoomMessageEvent,
@@ -61,9 +65,12 @@ use matrix_sdk::{
                 RoomMessageEventContentWithoutRelation,
             },
             room::redaction::{OriginalSyncRoomRedactionEvent, SyncRoomRedactionEvent},
+            sticker::{StickerEvent, StickerEventContent},
             tag::{TagName, Tags},
         },
         presence::PresenceState,
+        profile::{ProfileFieldName, ProfileFieldValue},
+        room::JoinRule,
     },
 };
 
@@ -78,29 +85,26 @@ use modalkit::{
             ApplicationStore,
             ApplicationWindowId,
         },
-        completion::{Completer, CompletionMap, complete_path},
+        completion::CompletionMap,
         context::EditContext,
-        cursor::Cursor,
-        rope::EditRope,
         store::Store,
     },
     env::vim::{
-        command::{CommandContext, CommandDescription, VimCommand, VimCommandMachine},
+        command::{CommandContext, VimCommand, VimCommandMachine},
         keybindings::VimMachine,
     },
     errors::{UIError, UIResult},
     key::TerminalKey,
     keybindings::SequenceStatus,
-    prelude::{CommandType, WordStyle},
+    prelude::{CommandType, MoveDir1D, WordStyle},
 };
 
-use crate::config::ImagePreviewSize;
 use crate::preview::PreviewKind;
 use crate::{
-    config::{ApplicationSettings, ImagePreviewProtocolValues},
+    config::ApplicationSettings,
     message::{Message, MessageEvent, MessageKey, MessageTimeStamp, Messages},
     notifications::NotificationHandle,
-    preview::{PreviewManager, source_from_event},
+    preview::PreviewManager,
     worker::Requester,
 };
 
@@ -139,6 +143,9 @@ pub enum VerifyAction {
 
     /// Reject an in-progress verification due to mismatched Emoji.
     Mismatch,
+
+    /// Start an interactive (SAS) emoji verification
+    Emoji,
 }
 
 /// An action taken against the currently selected message.
@@ -191,10 +198,14 @@ pub enum MessageAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SpaceAction {
     /// Add a room or update metadata.
-    ///
-    /// The [`Option<String>`] argument is the order parameter.
-    /// The [`bool`] argument indicates whether the room is suggested.
-    SetChild(OwnedRoomId, Option<String>, bool),
+    SetChild {
+        /// The room ID, alias, or a user whose DM room should be added to the space.
+        child: String,
+        /// The order parameter to use when sorting children in the space.
+        order: Option<String>,
+        /// Whether the room is suggested.
+        suggested: bool,
+    },
 
     /// Remove the selected room.
     RemoveChild,
@@ -282,6 +293,8 @@ pub enum SortFieldUser {
     UserId,
     LocalPart,
     Server,
+    Knock,
+    Invite,
 }
 
 /// Whether to use the default sort direction for a field, or to reverse it.
@@ -388,6 +401,8 @@ impl Visitor<'_> for SortUserVisitor {
             "localpart" => SortFieldUser::LocalPart,
             "server" => SortFieldUser::Server,
             "power" => SortFieldUser::PowerLevel,
+            "knock" => SortFieldUser::Knock,
+            "invite" => SortFieldUser::Invite,
             _ => {
                 let msg = format!("Unknown sort field: {value:?}");
                 return Err(E::custom(msg));
@@ -401,11 +416,17 @@ impl Visitor<'_> for SortUserVisitor {
 /// A room property.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RoomField {
+    /// The room's join rules, aka who can access this room.
+    Access,
+
     /// The room's history visibility.
     History,
 
     /// The room name.
     Name,
+
+    /// The room version.
+    Version,
 
     /// The room id.
     Id,
@@ -427,6 +448,9 @@ pub enum RoomField {
 
     /// The room's canonical alias.
     CanonicalAlias,
+
+    /// The users own display name.
+    UserName,
 }
 
 /// An action that operates on a room member.
@@ -447,9 +471,58 @@ impl Display for MemberUpdateAction {
     }
 }
 
+/// An internal version of [`JoinRule`]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IambJoinRule {
+    Public,
+    Restricted(Vec<OwnedRoomOrAliasId>),
+    Knock,
+    KnockRestricted(Vec<OwnedRoomOrAliasId>),
+    Invite,
+}
+
+impl IambJoinRule {
+    pub async fn into_join_rule(self, client: &Client) -> Result<JoinRule, IambError> {
+        async fn resolve_aliases(
+            rooms: Vec<OwnedRoomOrAliasId>,
+            client: &Client,
+        ) -> Result<Restricted, IambError> {
+            let mut allow = vec![];
+            for room in rooms {
+                let alias = match OwnedRoomId::try_from(room) {
+                    Ok(room_id) => {
+                        allow.push(AllowRule::room_membership(room_id));
+                        continue;
+                    },
+                    Err(alias) => alias,
+                };
+
+                let resp = client.resolve_room_alias(&alias).await?;
+
+                allow.push(AllowRule::room_membership(resp.room_id));
+            }
+
+            Ok(Restricted::new(allow))
+        }
+
+        Ok(match self {
+            Self::Public => JoinRule::Public,
+            Self::Invite => JoinRule::Invite,
+            Self::Knock => JoinRule::Knock,
+            Self::Restricted(rooms) => JoinRule::Restricted(resolve_aliases(rooms, client).await?),
+            Self::KnockRestricted(rooms) => {
+                JoinRule::KnockRestricted(resolve_aliases(rooms, client).await?)
+            },
+        })
+    }
+}
+
 /// An action that operates on a focused room.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RoomAction {
+    /// Follow the room upgrade information.
+    Follow(Box<CommandContext>, MoveDir1D),
+
     /// Accept an invitation to join this room.
     InviteAccept,
 
@@ -458,6 +531,16 @@ pub enum RoomAction {
 
     /// Invite a user to this room.
     InviteSend(OwnedUserId),
+
+    /// Accept a knock from someone who wants to join this room.
+    KnockAccept(OwnedUserId),
+
+    /// Reject a knock from someone who wants to join this room.
+    KnockReject(OwnedUserId, Option<String>),
+
+    /// Reject a knock from someone who wants to join this room and ban them
+    /// to prevent them from being able to try knocking again.
+    KnockBan(OwnedUserId, Option<String>),
 
     /// Leave this room.
     Leave(bool),
@@ -471,11 +554,17 @@ pub enum RoomAction {
     /// Set whether a room is a direct message.
     SetDirect(bool),
 
+    /// Set the join rules for a room to control who can access it and how.
+    SetAccess(IambJoinRule),
+
     /// Set a room property.
     Set(RoomField, String),
 
     /// Unset a room property.
     Unset(RoomField),
+
+    /// Upgrade the version of a room.
+    Upgrade(RoomVersionId, Vec<OwnedUserId>, bool),
 
     /// List the values in a list room property.
     Show(RoomField),
@@ -510,9 +599,24 @@ pub enum SendAction {
 pub enum HomeserverAction {
     /// Create a new room with an optional localpart.
     CreateRoom(Option<String>, CreateRoomType, CreateRoomFlags),
+
+    /// "Knock" on a room, aka "request to join".
+    KnockSend(OwnedRoomOrAliasId, Option<String>),
+
+    /// Logout the current iamb session on the homeserver.
     Logout(String, bool),
+
     /// Forget all left rooms
     Forget,
+
+    /// Set a profile field.
+    ProfileFieldSet(ProfileFieldValue),
+
+    /// Set a profile field.
+    ProfileFieldUnset(ProfileFieldName),
+
+    /// Set a profile field.
+    ProfileFieldShow(ProfileFieldName),
 }
 
 /// An action performed against the user's room keys.
@@ -837,6 +941,10 @@ pub enum IambError {
     /// A failure while trying to show an image preview.
     #[error("Preview error: {0}")]
     Preview(String),
+
+    /// A generic error that doesn't need a specific error type.
+    #[error("{0}")]
+    Custom(String),
 }
 
 impl From<IambError> for UIError<IambInfo> {
@@ -876,9 +984,6 @@ pub enum EventLocation {
     /// The [EventId] belongs to a state event in the main timeline of the room.
     State(MessageKey),
 
-    /// The [EventId] belongs to a sticker event in the main scrollback
-    Sticker(MessageKey),
-
     /// The [EventId] belongs to an edit for the given event and has key [MessageKey].
     Edit(OwnedEventId, MessageKey),
 }
@@ -887,7 +992,6 @@ impl EventLocation {
     fn to_message_key(&self) -> Option<&MessageKey> {
         match self {
             EventLocation::Message(_, key) => Some(key),
-            EventLocation::Sticker(key) => Some(key),
             _ => None,
         }
     }
@@ -1253,12 +1357,6 @@ impl RoomInfo {
 
                 self.keys.remove(redacts);
             },
-            Some(EventLocation::Sticker(key)) => {
-                if let Some(msg) = self.messages.get_mut(key) {
-                    let ev = SyncRoomRedactionEvent::Original(ev);
-                    msg.redact(ev);
-                }
-            },
         }
     }
 
@@ -1281,49 +1379,46 @@ impl RoomInfo {
     }
 
     /// Insert a sticker
-    pub fn insert_sticker(
+    pub fn insert_sticker_with_preview(
         &mut self,
         sticker: StickerEvent,
         settings: &ApplicationSettings,
         previews: &mut PreviewManager,
         worker: &Requester,
     ) {
-        match sticker {
-            MessageLikeEvent::Original(ref sticker_content) => {
-                let key = MessageKey {
-                    ts: sticker_content.origin_server_ts.into(),
-                    id: sticker_content.event_id.clone().into(),
-                };
+        let event_id = sticker.event_id().to_owned();
+        let key = MessageKey {
+            ts: sticker.origin_server_ts().into(),
+            id: event_id.clone().into(),
+        };
 
-                let loc = EventLocation::Sticker(key.clone());
+        let thread_root = match &sticker {
+            MessageLikeEvent::Original(OriginalMessageLikeEvent {
+                content:
+                    StickerEventContent {
+                        relates_to: Some(Relation::Thread(Thread { event_id, .. })),
+                        ..
+                    },
+                ..
+            }) => Some(event_id.to_owned()),
+            _ => None,
+        };
 
-                self.keys.insert(sticker_content.event_id.clone(), loc);
-                self.messages.insert_message(key.clone(), sticker.clone());
-
-                if let (Some(msg), Some(image_preview)) = (
-                    self.get_event_mut(&sticker_content.event_id),
-                    &settings.tunables.image_preview,
-                ) {
-                    let source: MediaSource = sticker_content.content.source.clone().into();
-                    msg.image_preview = Some(source.clone());
-                    previews.register_preview(
-                        settings,
-                        source,
-                        PreviewKind::Message,
-                        image_preview.size,
-                        worker,
-                    );
-                }
-            },
-            MessageLikeEvent::Redacted(ref redaction) => {
-                let key = MessageKey {
-                    ts: redaction.origin_server_ts.into(),
-                    id: redaction.event_id.clone().into(),
-                };
-
-                self.messages.insert_message(key.clone(), sticker.clone());
-            },
+        if let MessageLikeEvent::Original(OriginalMessageLikeEvent {
+            content: StickerEventContent { source, .. },
+            ..
+        }) = &sticker &&
+            settings.tunables.image_preview.enabled
+        {
+            let source = source.clone().into();
+            previews.register_preview(settings, &source, PreviewKind::Message, worker);
         }
+
+        let loc = EventLocation::Message(thread_root.clone(), key.clone());
+        self.keys.insert(event_id, loc);
+
+        let thread = self.get_thread_mut(thread_root);
+        thread.insert_message(key, sticker);
     }
 
     /// Insert a reaction to a message.
@@ -1338,18 +1433,19 @@ impl RoomInfo {
             return;
         };
         let image_uri = OwnedMxcUri::from(orig_react.content.relates_to.key.as_str());
-        let source = if image_uri.is_valid() && settings.tunables.image_preview.is_some() {
+        let source = if image_uri.is_valid() && settings.tunables.image_preview.enabled {
             Some(MediaSource::Plain(image_uri))
         } else {
             None
         };
 
-        self.insert_reaction(react, source.clone());
-
-        if let (Some(source), Some(_)) = (source, &settings.tunables.image_preview) {
-            let size = ImagePreviewSize { width: 2, height: 1 };
-            previews.register_preview(settings, source, PreviewKind::Reaction, size, worker);
+        if settings.tunables.image_preview.enabled &&
+            let Some(source) = source.as_ref()
+        {
+            previews.register_preview(settings, source, PreviewKind::Reaction, worker);
         }
+
+        self.insert_reaction(react, source);
     }
 
     /// Insert an edit.
@@ -1493,22 +1589,16 @@ impl RoomInfo {
         previews: &mut PreviewManager,
         worker: &Requester,
     ) {
-        let source = source_from_event(&ev);
-        self.insert(ev);
-
-        if let Some((event_id, source)) = source &&
-            let (Some(msg), Some(image_preview)) =
-                (self.get_event_mut(&event_id), &settings.tunables.image_preview)
+        if let MessageLikeEvent::Original(OriginalMessageLikeEvent {
+            content: RoomMessageEventContent { msgtype: MessageType::Image(c), .. },
+            ..
+        }) = &ev &&
+            settings.tunables.image_preview.enabled
         {
-            msg.image_preview = Some(source.clone());
-            previews.register_preview(
-                settings,
-                source,
-                PreviewKind::Message,
-                image_preview.size,
-                worker,
-            )
+            previews.register_preview(settings, &c.source, PreviewKind::Message, worker)
         }
+
+        self.insert(ev);
     }
 
     /// Indicates whether we've recently fetched scrollback for this room.
@@ -1700,51 +1790,6 @@ fn emoji_map() -> CompletionMap<String, &'static Emoji> {
     return emojis;
 }
 
-#[cfg(unix)]
-fn picker_from_termios(protocol_type: Option<ProtocolType>) -> Option<Picker> {
-    let mut picker = match Picker::from_query_stdio() {
-        Ok(picker) => picker,
-        Err(e) => {
-            tracing::error!("Failed to setup image previews: {e}");
-            return None;
-        },
-    };
-
-    if let Some(protocol_type) = protocol_type {
-        picker.set_protocol_type(protocol_type);
-    }
-
-    Some(picker)
-}
-
-/// Windows cannot guess the right protocol, and always needs type and font_size.
-#[cfg(windows)]
-fn picker_from_termios(_: Option<ProtocolType>) -> Option<Picker> {
-    tracing::error!(
-        "\"image_preview\" requires \"protocol\" with \"type\" and \"font_size\" options on Windows."
-    );
-    None
-}
-
-fn picker_from_settings(settings: &ApplicationSettings) -> Option<Picker> {
-    let image_preview = settings.tunables.image_preview.as_ref()?;
-    let image_preview_protocol = image_preview.protocol.as_ref();
-
-    if let Some(&ImagePreviewProtocolValues {
-        r#type: Some(protocol_type),
-        font_size: Some(font_size),
-    }) = image_preview_protocol
-    {
-        // User forced type and font_size: use that.
-        let mut picker = Picker::from_fontsize(font_size);
-        picker.set_protocol_type(protocol_type);
-        Some(picker)
-    } else {
-        // Guess, but use type if forced.
-        picker_from_termios(image_preview_protocol.and_then(|p| p.r#type))
-    }
-}
-
 /// Information gathered during server syncs about joined rooms.
 #[derive(Default)]
 pub struct SyncInfo {
@@ -1853,7 +1898,8 @@ pub struct ChatStore {
     pub presences: CompletionMap<OwnedUserId, PresenceState>,
 
     /// In-progress and completed verifications.
-    pub verifications: HashMap<String, SasVerification>,
+    /// The map key is the `flow_id`.
+    pub verifications: CompletionMap<String, VerificationRequest>,
 
     /// Settings for the current profile loaded from config file.
     pub settings: ApplicationSettings,
@@ -1889,12 +1935,12 @@ pub struct ChatStore {
 impl ChatStore {
     /// Create a new [ChatStore].
     pub fn new(worker: Requester, settings: ApplicationSettings) -> Self {
-        let picker = picker_from_settings(&settings);
+        let previews = PreviewManager::new(&settings);
 
         ChatStore {
             worker,
             settings,
-            previews: PreviewManager::new(picker),
+            previews,
             cmds: crate::commands::setup_commands(),
             emojis: emoji_map(),
 
@@ -1923,6 +1969,11 @@ impl ChatStore {
         }
     }
 
+    /// Get the alias for a room if it has one (and the client knows it).
+    pub fn get_joined_room_alias(&self, room_id: &RoomId) -> Option<OwnedRoomAliasId> {
+        self.worker.client.get_room(room_id).and_then(|r| r.canonical_alias())
+    }
+
     /// Get the title for a room.
     pub fn get_room_title(&self, room_id: &RoomId) -> String {
         self.rooms
@@ -1940,13 +1991,6 @@ impl ChatStore {
     /// Set the name for a room.
     pub fn set_room_name(&mut self, room_id: &RoomId, name: &str) {
         self.rooms.get_or_default(room_id.to_owned()).name = name.to_string().into();
-    }
-
-    /// Insert a new E2EE verification.
-    pub fn insert_sas(&mut self, sas: SasVerification) {
-        let key = format!("{}/{}", sas.other_user_id(), sas.other_device().device_id());
-
-        self.verifications.insert(key, sas);
     }
 }
 
@@ -2261,197 +2305,6 @@ impl ApplicationInfo for IambInfo {
     }
 }
 
-pub struct IambCompleter;
-
-impl Completer<IambInfo> for IambCompleter {
-    fn complete(
-        &mut self,
-        text: &EditRope,
-        cursor: &mut Cursor,
-        content: &IambBufferId,
-        store: &mut ChatStore,
-    ) -> Vec<String> {
-        match content {
-            IambBufferId::Command(CommandType::Command) => complete_cmdbar(text, cursor, store),
-            IambBufferId::Command(CommandType::Search) => vec![],
-            IambBufferId::Room(_, _, RoomFocus::MessageBar) => complete_msgbar(text, cursor, store),
-            IambBufferId::Room(_, _, RoomFocus::Scrollback) => vec![],
-
-            IambBufferId::DirectList => vec![],
-            IambBufferId::MemberList(_) => vec![],
-            IambBufferId::RoomList => vec![],
-            IambBufferId::SpaceList => vec![],
-            IambBufferId::VerifyList => vec![],
-            IambBufferId::Welcome => vec![],
-            IambBufferId::ChatList => vec![],
-            IambBufferId::UnreadList => vec![],
-            IambBufferId::MentionsList => vec![],
-        }
-    }
-}
-
-/// Tab completion for user IDs.
-fn complete_users(text: &EditRope, cursor: &mut Cursor, store: &ChatStore) -> Vec<String> {
-    let id = text
-        .get_prefix_word_mut(cursor, &MATRIX_ID_WORD)
-        .unwrap_or_else(EditRope::empty);
-    let id = Cow::from(&id);
-
-    store
-        .presences
-        .complete(id.as_ref())
-        .into_iter()
-        .map(|i| i.to_string())
-        .collect()
-}
-
-/// Tab completion within the message bar.
-fn complete_msgbar(text: &EditRope, cursor: &mut Cursor, store: &ChatStore) -> Vec<String> {
-    let id = text
-        .get_prefix_word_mut(cursor, &MATRIX_ID_WORD)
-        .unwrap_or_else(EditRope::empty);
-    let id = Cow::from(&id);
-
-    match id.chars().next() {
-        // Complete room aliases.
-        Some('#') => {
-            return store.names.complete(id.as_ref());
-        },
-
-        // Complete room identifiers.
-        Some('!') => {
-            return store
-                .rooms
-                .complete(id.as_ref())
-                .into_iter()
-                .map(|i| i.to_string())
-                .collect();
-        },
-
-        // Complete Emoji shortcodes.
-        Some(':') => {
-            let list = store.emojis.complete(&id[1..]);
-            let iter = list.into_iter().take(200).map(|s| format!(":{s}:"));
-
-            return iter.collect();
-        },
-
-        // Complete usernames for @ and empty strings.
-        Some('@') | None => {
-            return store
-                .presences
-                .complete(id.as_ref())
-                .into_iter()
-                .map(|i| i.to_string())
-                .collect();
-        },
-
-        // Unknown sigil.
-        Some(_) => return vec![],
-    }
-}
-
-/// Tab completion for Matrix identifiers (usernames, room aliases, etc.)
-fn complete_matrix_names(text: &EditRope, cursor: &mut Cursor, store: &ChatStore) -> Vec<String> {
-    let id = text
-        .get_prefix_word_mut(cursor, &MATRIX_ID_WORD)
-        .unwrap_or_else(EditRope::empty);
-    let id = Cow::from(&id);
-
-    let list = store.names.complete(id.as_ref());
-    if !list.is_empty() {
-        return list;
-    }
-
-    let list = store.presences.complete(id.as_ref());
-    if !list.is_empty() {
-        return list.into_iter().map(|i| i.to_string()).collect();
-    }
-
-    store
-        .rooms
-        .complete(id.as_ref())
-        .into_iter()
-        .map(|i| i.to_string())
-        .collect()
-}
-
-/// Tab completion for Emoji shortcode names.
-fn complete_emoji(text: &EditRope, cursor: &mut Cursor, store: &ChatStore) -> Vec<String> {
-    let sc = text.get_prefix_word_mut(cursor, &WordStyle::Little);
-    let sc = sc.unwrap_or_else(EditRope::empty);
-    let sc = Cow::from(&sc);
-
-    store.emojis.complete(sc.as_ref())
-}
-
-/// Tab completion for command names.
-fn complete_cmdname(
-    desc: CommandDescription,
-    text: &EditRope,
-    cursor: &mut Cursor,
-    store: &ChatStore,
-) -> Vec<String> {
-    // Complete command name and set cursor position.
-    let _ = text.get_prefix_word_mut(cursor, &WordStyle::Little);
-    store.cmds.complete_name(desc.command.as_str())
-}
-
-/// Tab completion for command arguments.
-fn complete_cmdarg(
-    desc: CommandDescription,
-    text: &EditRope,
-    cursor: &mut Cursor,
-    store: &ChatStore,
-) -> Vec<String> {
-    let cmd = match store.cmds.get(desc.command.as_str()) {
-        Ok(cmd) => cmd,
-        Err(_) => return vec![],
-    };
-
-    match cmd.name.as_str() {
-        "cancel" | "dms" | "edit" | "redact" | "reply" => vec![],
-        "members" | "rooms" | "spaces" | "welcome" => vec![],
-        "download" | "keys" | "open" | "upload" => complete_path(text, cursor),
-        "react" | "unreact" => complete_emoji(text, cursor, store),
-
-        "invite" => complete_users(text, cursor, store),
-        "join" | "split" | "vsplit" | "tabedit" => complete_matrix_names(text, cursor, store),
-        "room" => vec![],
-        "verify" => vec![],
-        "vertical" | "horizontal" | "aboveleft" | "belowright" | "tab" => {
-            complete_cmd(desc.arg.text.as_str(), text, cursor, store)
-        },
-        _ => vec![],
-    }
-}
-
-/// Tab completion for commands.
-fn complete_cmd(cmd: &str, text: &EditRope, cursor: &mut Cursor, store: &ChatStore) -> Vec<String> {
-    match CommandDescription::from_str(cmd) {
-        Ok(desc) => {
-            if desc.arg.untrimmed.is_empty() {
-                complete_cmdname(desc, text, cursor, store)
-            } else {
-                // Complete command argument.
-                complete_cmdarg(desc, text, cursor, store)
-            }
-        },
-
-        // Can't parse command text, so return zero completions.
-        Err(_) => vec![],
-    }
-}
-
-/// Tab completion for the command bar.
-fn complete_cmdbar(text: &EditRope, cursor: &mut Cursor, store: &ChatStore) -> Vec<String> {
-    let eo = text.cursor_to_offset(cursor);
-    let slice = text.slice(..eo);
-    let cow = Cow::from(&slice);
-
-    complete_cmd(cow.as_ref(), text, cursor, store)
-}
-
 #[cfg(test)]
 pub mod tests {
     use std::iter::FromIterator as _;
@@ -2617,81 +2470,6 @@ pub mod tests {
             room_id,
             Need { members: true, messages: Some(Vec::new()) }
         )],);
-    }
-
-    #[tokio::test]
-    async fn test_complete_msgbar() {
-        let store = mock_store().await;
-        let store = store.application;
-
-        let text = EditRope::from("going for a walk :walk ");
-        let mut cursor = Cursor::new(0, 22);
-        let res = complete_msgbar(&text, &mut cursor, &store);
-        assert_eq!(res, vec![":walking:", ":walking_man:", ":walking_woman:"]);
-        assert_eq!(cursor, Cursor::new(0, 17));
-
-        let text = EditRope::from("hello @user1 ");
-        let mut cursor = Cursor::new(0, 12);
-        let res = complete_msgbar(&text, &mut cursor, &store);
-        assert_eq!(res, vec!["@user1:example.com"]);
-        assert_eq!(cursor, Cursor::new(0, 6));
-
-        let text = EditRope::from("see #room ");
-        let mut cursor = Cursor::new(0, 9);
-        let res = complete_msgbar(&text, &mut cursor, &store);
-        assert_eq!(res, vec!["#room1:example.com"]);
-        assert_eq!(cursor, Cursor::new(0, 4));
-    }
-
-    #[tokio::test]
-    async fn test_complete_cmdbar() {
-        let store = mock_store().await;
-        let store = store.application;
-        let users = vec![
-            "@user1:example.com",
-            "@user2:example.com",
-            "@user3:example.com",
-            "@user4:example.com",
-            "@user5:example.com",
-        ];
-
-        let text = EditRope::from("invite    ");
-        let mut cursor = Cursor::new(0, 7);
-        let id = text
-            .get_prefix_word_mut(&mut cursor, &MATRIX_ID_WORD)
-            .unwrap_or_else(EditRope::empty);
-        assert_eq!(id.to_string(), "");
-        assert_eq!(cursor, Cursor::new(0, 7));
-
-        let text = EditRope::from("invite    ");
-        let mut cursor = Cursor::new(0, 7);
-        let res = complete_cmdbar(&text, &mut cursor, &store);
-        assert_eq!(res, users);
-
-        let text = EditRope::from("invite ignored");
-        let mut cursor = Cursor::new(0, 7);
-        let res = complete_cmdbar(&text, &mut cursor, &store);
-        assert_eq!(res, users);
-
-        let text = EditRope::from("invite @user1ignored");
-        let mut cursor = Cursor::new(0, 13);
-        let res = complete_cmdbar(&text, &mut cursor, &store);
-        assert_eq!(res, vec!["@user1:example.com"]);
-
-        let text = EditRope::from("abo hor");
-        let mut cursor = Cursor::new(0, 7);
-        let res = complete_cmdbar(&text, &mut cursor, &store);
-        assert_eq!(res, vec!["horizontal"]);
-
-        let text = EditRope::from("abo hor inv");
-        let mut cursor = Cursor::new(0, 11);
-        let res = complete_cmdbar(&text, &mut cursor, &store);
-        assert_eq!(res, vec!["invite"]);
-
-        let text = EditRope::from("abo hor invite \n");
-        let mut cursor = Cursor::new(0, 15);
-        let res = complete_cmdbar(&text, &mut cursor, &store);
-        assert_eq!(res, users);
     }
 
     #[test]

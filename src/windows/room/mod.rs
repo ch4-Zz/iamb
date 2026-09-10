@@ -1,7 +1,6 @@
 //! # Windows for Matrix rooms and spaces
 use std::collections::HashSet;
 
-use matrix_sdk::ruma::api::error::ErrorKind as ClientApiErrorKind;
 use matrix_sdk::{
     RoomDisplayName,
     RoomState as MatrixRoomState,
@@ -12,6 +11,10 @@ use matrix_sdk::{
         OwnedRoomAliasId,
         OwnedUserId,
         RoomId,
+        api::{
+            client::room::upgrade_room::v3::Request as UpgradeRoomRequest,
+            error::ErrorKind as ClientApiErrorKind,
+        },
         events::{
             room::{
                 canonical_alias::RoomCanonicalAliasEventContent,
@@ -21,6 +24,7 @@ use matrix_sdk::{
             },
             tag::{TagInfo, Tags},
         },
+        room::{AllowRule, JoinRule, Restricted as JoinRestrictions},
     },
 };
 
@@ -40,6 +44,7 @@ use modalkit::actions::{
     PromptAction,
     Promptable,
     Scrollable,
+    WindowAction,
 };
 use modalkit::errors::{EditResult, UIError};
 use modalkit::prelude::*;
@@ -115,7 +120,32 @@ pub async fn room_command(
     ctx: ProgramContext,
     store: &mut ProgramStore,
 ) -> IambResult<Vec<(Action<IambInfo>, ProgramContext)>> {
+    let worker = &store.application.worker;
+
     match act {
+        RoomAction::Follow(cmd, dir) => {
+            let room = worker.client.get_room(id).ok_or(IambError::NotJoined)?;
+            let room_id = match dir {
+                MoveDir1D::Next => {
+                    let successor = room
+                        .successor_room()
+                        .ok_or_else(|| UIError::Failure("No successor room found".into()))?;
+                    successor.room_id
+                },
+                MoveDir1D::Previous => {
+                    let predecessor = room
+                        .predecessor_room()
+                        .ok_or_else(|| UIError::Failure("No predecessor room found".into()))?;
+                    predecessor.room_id
+                },
+            };
+
+            let id = IambId::Room(room_id.to_owned(), None);
+            let target = OpenTarget::Application(id);
+            let act = cmd.switch(target);
+
+            Ok(vec![(act, cmd.context.clone())])
+        },
         RoomAction::InviteAccept => {
             if let Some(room) = store.application.worker.client.get_room(id) {
                 room.join().await.map_err(IambError::from)?;
@@ -141,6 +171,21 @@ pub async fn room_command(
             } else {
                 Err(IambError::NotJoined.into())
             }
+        },
+        RoomAction::KnockAccept(user) => {
+            let room = worker.client.get_room(id).ok_or(IambError::NotJoined)?;
+            room.invite_user_by_id(&user).await.map_err(IambError::from)?;
+            Ok(vec![])
+        },
+        RoomAction::KnockReject(user, reason) => {
+            let room = worker.client.get_room(id).ok_or(IambError::NotJoined)?;
+            room.kick_user(&user, reason.as_deref()).await.map_err(IambError::from)?;
+            Ok(vec![])
+        },
+        RoomAction::KnockBan(user, reason) => {
+            let room = worker.client.get_room(id).ok_or(IambError::NotJoined)?;
+            room.ban_user(&user, reason.as_deref()).await.map_err(IambError::from)?;
+            Ok(vec![])
         },
         RoomAction::Leave(skip_confirm) => {
             if let Some(room) = store.application.worker.client.get_room(id) {
@@ -210,6 +255,17 @@ pub async fn room_command(
             };
 
             Ok(vec![(act, cmd.context.clone())])
+        },
+        RoomAction::SetAccess(rule) => {
+            let Some(room) = store.application.worker.client.get_room(id) else {
+                return Err(IambError::NotJoined.into());
+            };
+            let rule = rule.into_join_rule(&store.application.worker.client).await?;
+            room.privacy_settings()
+                .update_join_rule(rule)
+                .await
+                .map_err(IambError::from)?;
+            Ok(vec![])
         },
         RoomAction::SetDirect(is_direct) => {
             let room = store
@@ -355,11 +411,13 @@ pub async fn room_command(
                     ev.alt_aliases = alt_aliases.into_iter().collect();
                     let _ = room.send_state_event(ev).await.map_err(IambError::from)?;
                 },
-                RoomField::Aliases => {
-                    // This never happens, aliases is only used for showing
+                RoomField::UserName => {
+                    room.set_own_member_display_name(Some(value))
+                        .await
+                        .map_err(IambError::from)?;
                 },
-                RoomField::Id => {
-                    // This never happens, id is only used for showing
+                RoomField::Access | RoomField::Aliases | RoomField::Id | RoomField::Version => {
+                    // These variants exist for RoomAction::Show, so we never actually get here.
                 },
             }
 
@@ -451,11 +509,11 @@ pub async fn room_command(
                         .await
                         .map_err(IambError::from)?;
                 },
-                RoomField::Aliases => {
-                    // This will not happen, you cannot unset all aliases
+                RoomField::UserName => {
+                    room.set_own_member_display_name(None).await.map_err(IambError::from)?;
                 },
-                RoomField::Id => {
-                    // This never happens, id is only used for showing
+                RoomField::Access | RoomField::Aliases | RoomField::Id | RoomField::Version => {
+                    // These variants exist for RoomAction::Show, so we never actually get here.
                 },
             }
 
@@ -476,6 +534,11 @@ pub async fn room_command(
                 RoomField::Id => {
                     let id = room.room_id();
                     format!("Room identifier: {id}")
+                },
+                RoomField::Version => {
+                    let v = room.version();
+                    let v = v.as_ref().map(|v| v.as_str()).unwrap_or("<version unknown>");
+                    format!("Room version: {v}")
                 },
                 RoomField::Name => {
                     match room.name() {
@@ -503,6 +566,55 @@ pub async fn room_command(
 
                     format!("Room notification level: {level:?}")
                 },
+                RoomField::Access => {
+                    let show_restrictions = |rs: JoinRestrictions| {
+                        rs.allow
+                            .into_iter()
+                            .map(|a| {
+                                match a {
+                                    AllowRule::RoomMembership(m) => {
+                                        if let Some(alias) =
+                                            store.application.get_joined_room_alias(&m.room_id)
+                                        {
+                                            format!("members of {} ({alias})", m.room_id)
+                                        } else {
+                                            format!("members of {}", m.room_id)
+                                        }
+                                    },
+                                    other => format!("{other:?}"),
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+
+                    let desc = match room.join_rule() {
+                        None => "<unknown>".into(),
+                        Some(JoinRule::Invite) => "invite".into(),
+                        Some(JoinRule::Knock) => "knock".into(),
+                        Some(JoinRule::Private) => "private".into(),
+                        Some(JoinRule::Public) => "public".into(),
+                        Some(JoinRule::Restricted(restrictions)) => {
+                            let allowing = show_restrictions(restrictions);
+                            if allowing.is_empty() {
+                                "restricted".into()
+                            } else {
+                                format!("restricted, allowing {allowing}")
+                            }
+                        },
+                        Some(JoinRule::KnockRestricted(restrictions)) => {
+                            let allowing = show_restrictions(restrictions);
+                            if allowing.is_empty() {
+                                "knock-restricted".into()
+                            } else {
+                                format!("knock-restricted, allowing {allowing}")
+                            }
+                        },
+                        Some(other) => format!("{other:?}"),
+                    };
+
+                    format!("Room join rules are set to: {desc}")
+                },
                 RoomField::Aliases => {
                     let aliases = room
                         .alt_aliases()
@@ -526,12 +638,51 @@ pub async fn room_command(
                 RoomField::Alias(_) => {
                     "Cannot show a single alias; use `:room aliases show` instead.".into()
                 },
+                RoomField::UserName => {
+                    let user_id = &store.application.settings.profile.user_id;
+                    let Some(member) = room.get_member(user_id).await.map_err(IambError::from)?
+                    else {
+                        let msg = "Cannot find membership data".into();
+                        return Err(IambError::Custom(msg))?;
+                    };
+
+                    match member.display_name() {
+                        Some(name) => format!("User name: \"{name}\""),
+                        None => "No user name set".into(),
+                    }
+                },
             };
 
             let msg = InfoMessage::Pager(msg);
             let act = Action::ShowInfoMessage(msg);
 
             Ok(vec![(act, ctx)])
+        },
+        RoomAction::Upgrade(new_version, additional_creators, false) => {
+            let room = worker.client.get_room(id).ok_or(IambError::NotJoined)?;
+            let alias = room.canonical_alias();
+            let name = alias.as_ref().map(|c| c.as_str()).unwrap_or_else(|| id.as_str());
+            let msg = format!(
+                "Are you sure you want to upgrade {name} to version {new_version} with {} additional creators set?",
+                additional_creators.len()
+            );
+            let upgrade =
+                IambAction::Room(RoomAction::Upgrade(new_version, additional_creators, true));
+            let prompt = PromptYesNo::new(msg, vec![Action::from(upgrade)]);
+            let prompt = Box::new(prompt);
+
+            Err(UIError::NeedConfirm(prompt))
+        },
+        RoomAction::Upgrade(new_version, additional_creators, true) => {
+            let mut request = UpgradeRoomRequest::new(id.to_owned(), new_version);
+            request.additional_creators = additional_creators;
+
+            let response = worker.client.send(request).await.map_err(IambError::from)?;
+            let id = IambId::Room(response.replacement_room, None);
+            let target = OpenTarget::Application(id);
+            let act = WindowAction::Switch(target);
+
+            Ok(vec![(act.into(), ctx)])
         },
     }
 }
@@ -594,7 +745,7 @@ impl RoomState {
 
     fn draw_invite(
         &self,
-        invited: MatrixRoom,
+        invited: &MatrixRoom,
         area: Rect,
         buf: &mut Buffer,
         store: &mut ProgramStore,
@@ -619,6 +770,48 @@ impl RoomState {
             "You can run `:invite accept` or `:invite reject` to accept or reject this invitation.",
         );
         let text = Text::from(vec![l1, l2]);
+
+        Paragraph::new(text).alignment(Alignment::Center).render(area, buf);
+
+        return;
+    }
+
+    fn draw_knock(
+        &self,
+        knocked: &MatrixRoom,
+        area: Rect,
+        buf: &mut Buffer,
+        store: &mut ProgramStore,
+    ) {
+        let name = match knocked.canonical_alias() {
+            Some(alias) => alias.to_string(),
+            None => format!("{:?}", store.application.get_room_title(self.id())),
+        };
+
+        let l1 = Line::from(format!(
+            "Your request to join {name} is pending review by room moderators."
+        ));
+        let l2 = Line::from("You can run `:leave` to withdraw your knock request.");
+        let text = Text::from(vec![l1, l2]);
+
+        Paragraph::new(text).alignment(Alignment::Center).render(area, buf);
+
+        return;
+    }
+
+    fn draw_left(&self, room: &MatrixRoom, area: Rect, buf: &mut Buffer, store: &mut ProgramStore) {
+        let name = match room.canonical_alias() {
+            Some(alias) => alias.to_string(),
+            None => format!("{:?}", store.application.get_room_title(self.id())),
+        };
+
+        let mut lines = vec![Line::from(format!("You have left {name}!"))];
+
+        if room.is_public().is_some_and(|b| b) {
+            lines.push(Line::from(format!("You can run `:join {name}` to rejoin.")));
+        }
+
+        let text = Text::from(lines);
 
         Paragraph::new(text).alignment(Alignment::Center).render(area, buf);
 
@@ -768,16 +961,23 @@ impl TerminalCursor for RoomState {
     fn get_term_cursor(&self) -> Option<TermOffset> {
         delegate!(self, w => w.get_term_cursor())
     }
+
+    fn hide_term_cursor(&self) -> bool {
+        delegate!(self, w => w.hide_term_cursor())
+    }
 }
 
 impl WindowOps<IambInfo> for RoomState {
     fn draw(&mut self, area: Rect, buf: &mut Buffer, focused: bool, store: &mut ProgramStore) {
-        if self.room().state() == MatrixRoomState::Invited {
+        if self.room().state() != MatrixRoomState::Joined {
             self.refresh_room(store);
         }
 
-        if self.room().state() == MatrixRoomState::Invited {
-            self.draw_invite(self.room().clone(), area, buf, store);
+        match self.room().state() {
+            MatrixRoomState::Invited => return self.draw_invite(self.room(), area, buf, store),
+            MatrixRoomState::Knocked => return self.draw_knock(self.room(), area, buf, store),
+            MatrixRoomState::Left => return self.draw_left(self.room(), area, buf, store),
+            _ => (),
         }
 
         match self {

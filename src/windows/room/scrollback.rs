@@ -1,5 +1,5 @@
 //! Message scrollback
-use ratatui_image::Image;
+use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use regex::Regex;
 
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
@@ -125,6 +125,9 @@ pub struct ScrollbackState {
     /// The currently selected message in the scrollback.
     cursor: MessageCursor,
 
+    /// The cursor position relative to the terminal viewport.
+    term_cursor: (u16, u16),
+
     /// Contextual info about the viewport used during rendering.
     viewctx: ViewportContext<MessageCursor>,
 
@@ -154,6 +157,7 @@ impl ScrollbackState {
             viewctx,
             jumped,
             show_full_on_redraw,
+            term_cursor: (0, 0),
         }
     }
 
@@ -607,6 +611,7 @@ impl WindowOps<IambInfo> for ScrollbackState {
             viewctx: self.viewctx.clone(),
             jumped: self.jumped.clone(),
             show_full_on_redraw: false,
+            term_cursor: (0, 0),
         }
     }
 
@@ -702,7 +707,8 @@ impl EditorActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
                         let dir = flip.resolve(&dir);
 
                         let lsearch = store.registers.get_last_search().to_string();
-                        let needle = Regex::new(lsearch.as_ref())?;
+                        let ci = store.application.settings.tunables.ignorecase;
+                        let needle = crate::util::compile_search(lsearch.as_ref(), ci)?;
 
                         let (mc, needs_load) = self.find_message(key, dir, &needle, count, info);
                         if needs_load {
@@ -778,7 +784,8 @@ impl EditorActions<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
                         let dir = flip.resolve(&dir);
 
                         let lsearch = store.registers.get_last_search().to_string();
-                        let needle = Regex::new(lsearch.as_ref())?;
+                        let ci = store.application.settings.tunables.ignorecase;
+                        let needle = crate::util::compile_search(lsearch.as_ref(), ci)?;
 
                         let (mc, needs_load) = self.find_message(key, dir, &needle, count, info);
                         if needs_load {
@@ -1262,7 +1269,11 @@ impl Searchable<ProgramContext, ProgramStore, IambInfo> for ScrollbackState {
 
 impl TerminalCursor for ScrollbackState {
     fn get_term_cursor(&self) -> Option<(u16, u16)> {
-        None
+        self.term_cursor.into()
+    }
+
+    fn hide_term_cursor(&self) -> bool {
+        true
     }
 }
 
@@ -1316,6 +1327,8 @@ impl StatefulWidget for Scrollback<'_> {
     type State = ScrollbackState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
+        state.term_cursor = (area.left(), area.top());
+
         let info = self.store.application.rooms.get_or_default(state.room_id.clone());
         let settings = &self.store.application.settings;
         let area = if state.cursor.timestamp.is_some() {
@@ -1364,38 +1377,42 @@ impl StatefulWidget for Scrollback<'_> {
         let mut prev = prevmsg(&corner_key, thread);
 
         // load image previews
-        for (key, item) in thread.range(&corner_key..).rev() {
-            if let Some(source) = &item.image_preview {
-                self.store.application.previews.load(
-                    source,
-                    PreviewKind::Message,
-                    &self.store.application.worker,
-                );
-            }
-            let reply = item
-                .reply_to()
-                .or_else(|| item.thread_root())
-                .and_then(|e| info.get_event(&e))
-                .and_then(|msg| msg.image_preview.as_ref());
-            if let Some(source) = reply {
-                self.store.application.previews.load(
-                    source,
-                    PreviewKind::Message,
-                    &self.store.application.worker,
-                );
-            }
-            if let Some(event_id) = key.id.as_origin() {
-                for source in info.get_reaction_images(event_id) {
+        if settings.tunables.image_preview.enabled {
+            for (key, item) in thread.range(&corner_key..).rev() {
+                if let Some(source) = item.image_preview() {
                     self.store.application.previews.load(
                         source,
-                        PreviewKind::Reaction,
+                        PreviewKind::Message,
                         &self.store.application.worker,
                     );
+                }
+                let reply = item
+                    .reply_to()
+                    .or_else(|| item.thread_root())
+                    .and_then(|e| info.get_event(&e))
+                    .and_then(|msg| msg.image_preview());
+                if let Some(source) = reply {
+                    self.store.application.previews.load(
+                        source,
+                        PreviewKind::Message,
+                        &self.store.application.worker,
+                    );
+                }
+                if let Some(event_id) = key.id.as_origin() {
+                    for source in info.get_reaction_images(event_id) {
+                        self.store.application.previews.load(
+                            source,
+                            PreviewKind::Reaction,
+                            &self.store.application.worker,
+                        );
+                    }
                 }
             }
         }
 
         let previews = &self.store.application.previews;
+        let mut image_previews = vec![];
+
         for (key, item) in thread.range(&corner_key..) {
             let sel = key == cursor_key;
 
@@ -1403,6 +1420,8 @@ impl StatefulWidget for Scrollback<'_> {
                 item.show_with_preview(prev, foc && sel, &state.viewctx, info, settings, previews);
 
             let incomplete_ok = !full || !sel;
+
+            let includes_date_line = item.show_date(prev);
 
             for (row, line) in txt.lines.into_iter().enumerate() {
                 if sawit && lines.len() >= height && incomplete_ok {
@@ -1412,7 +1431,13 @@ impl StatefulWidget for Scrollback<'_> {
                 }
 
                 if key == &corner_key && row < corner.text_row {
-                    // Skip rows above the viewport corner.
+                    // Skip rows above the viewport corner but keep image previews.
+                    let y = area.top() as i16 + row as i16 - corner.text_row as i16;
+                    let line_previews = msg_previews
+                        .extract_if(.., |(_, _, y)| *y as usize == row)
+                        .map(|(backend, msg_x, _)| (area.left() + msg_x, y, backend));
+                    image_previews.extend(line_previews);
+
                     continue;
                 }
 
@@ -1420,7 +1445,7 @@ impl StatefulWidget for Scrollback<'_> {
                 let line_preview: Vec<_> =
                     msg_previews.extract_if(.., |(_, _, y)| *y as usize == row).collect();
 
-                lines.push((key, row, line, line_preview));
+                lines.push((key, row, line, line_preview, includes_date_line));
                 sawit |= sel;
             }
 
@@ -1429,10 +1454,19 @@ impl StatefulWidget for Scrollback<'_> {
 
         if lines.len() > height {
             let n = lines.len() - height;
-            let _ = lines.drain(..n);
+            let previews =
+                lines
+                    .drain(..n)
+                    .zip(-(n as i16)..)
+                    .flat_map(|((_, _, _, line_previews, _), y)| {
+                        line_previews.into_iter().map(move |(backend, msg_x, _)| {
+                            (area.left() + msg_x, area.top() as i16 + y, backend)
+                        })
+                    });
+            image_previews.extend(previews);
         }
 
-        if let Some((key, row, _, _)) = lines.first() {
+        if let Some((key, row, _, _, _)) = lines.first() {
             state.viewctx.corner.timestamp = Some((*key).clone());
             state.viewctx.corner.text_row = *row;
         }
@@ -1440,25 +1474,42 @@ impl StatefulWidget for Scrollback<'_> {
         let mut y = area.top();
         let x = area.left();
 
-        let mut image_previews = vec![];
-        for (_, _, txt, line_preview) in lines.into_iter() {
+        for (key, row, txt, line_preview, includes_date_line) in lines.into_iter() {
             let _ = buf.set_line(x, y, &txt, area.width);
             image_previews.extend(
-                line_preview.into_iter().map(|(backend, msg_x, _)| (x + msg_x, y, backend)),
+                line_preview
+                    .into_iter()
+                    .map(|(backend, msg_x, _)| (x + msg_x, y as i16, backend)),
             );
+
+            if key == cursor_key && row == usize::from(includes_date_line) {
+                state.term_cursor = (x, y);
+            }
 
             y += 1;
         }
+
+        let msg_width = Message::message_column_width(&state.viewctx, settings);
+
         // Render image previews after all text lines have been drawn, as the render might draw below the current
         // line.
         for (x, y, backend) in image_previews {
-            let image_widget = Image::new(backend);
-            let mut rect = backend.area();
-            rect.x = x;
-            rect.y = y;
-            // Don't render outside of scrollback area
-            if rect.bottom() <= area.bottom() && rect.right() <= area.right() {
-                image_widget.render(rect, buf);
+            if backend.size().height as i16 + y >= area.y as i16 {
+                let hidden_lines = (area.y as i16 - y).max(0);
+
+                let position = SignedPosition { x: 0, y: -hidden_lines };
+                let image_widget = SlicedImage::new(backend, position);
+                let mut rect: Rect = backend.size().into();
+                rect.x = x;
+                rect.y = (y + hidden_lines) as u16;
+
+                rect.height -= hidden_lines as u16;
+                rect.width = rect.width.min(msg_width as u16);
+
+                let rect = rect.intersection(area);
+                if !rect.is_empty() {
+                    image_widget.render(rect, buf);
+                }
             }
         }
 

@@ -28,8 +28,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::{CommandFactory, Parser};
-use matrix_sdk::ruma::OwnedUserId;
+use matrix_sdk::ruma::UserId;
 use matrix_sdk::ruma::api::error::ErrorKind;
+use matrix_sdk::ruma::profile::{ProfileFieldName, ProfileFieldValue};
 use matrix_sdk_crypto::encrypt_room_key_export;
 use modalkit::keybindings::InputBindings;
 use rand::RngExt as _;
@@ -73,6 +74,7 @@ use ratatui::{
 
 mod base;
 mod commands;
+mod completions;
 mod config;
 mod keybindings;
 mod message;
@@ -85,6 +87,7 @@ mod worker;
 
 #[cfg(test)]
 mod tests;
+mod verifications;
 
 use crate::{
     base::{
@@ -92,7 +95,6 @@ use crate::{
         ChatStore,
         HomeserverAction,
         IambAction,
-        IambCompleter,
         IambError,
         IambId,
         IambInfo,
@@ -102,6 +104,7 @@ use crate::{
         ProgramContext,
         ProgramStore,
     },
+    completions::IambCompleter,
     config::{ApplicationSettings, Iamb},
     windows::IambWindow,
     worker::{ClientWorker, LoginStyle, Requester, create_room},
@@ -320,7 +323,7 @@ impl Application {
             let area = f.area();
 
             let modestr = bindings.show_mode();
-            let cursor = bindings.get_cursor_indicator();
+            let cursor = bindings.get_cursor_hint();
             let dialogstr = bindings.show_dialog(area.height as usize, area.width as usize);
 
             // Don't show terminal cursor when we show a dialog.
@@ -342,7 +345,7 @@ impl Application {
             }
 
             if let Some((cx, cy)) = sstate.get_term_cursor() {
-                if let Some(c) = cursor {
+                if let Some(c) = cursor.get_indicator() {
                     let style = Style::default().fg(Color::Green);
                     let span = Span::styled(c.to_string(), style);
                     let para = Paragraph::new(span);
@@ -352,6 +355,9 @@ impl Application {
                 f.set_cursor_position((cx, cy));
             }
         })?;
+        if sstate.hide_term_cursor() {
+            term.hide_cursor()?;
+        }
 
         Ok(())
     }
@@ -616,19 +622,15 @@ impl Application {
                 None
             },
 
-            IambAction::Verify(act, user_dev) => {
-                if let Some(sas) = store.application.verifications.get(&user_dev) {
-                    self.worker.verify(act, sas.clone())?
-                } else {
-                    return Err(IambError::InvalidVerificationId(user_dev).into());
-                }
+            IambAction::Verify(act, flow_id) => {
+                return verifications::iamb_verify(act, flow_id, store).await;
             },
             IambAction::VerifyRequest(user_id) => {
-                if let Ok(user_id) = OwnedUserId::try_from(user_id.as_str()) {
-                    self.worker.verify_request(user_id)?
-                } else {
+                let Ok(user_id) = <&UserId>::try_from(user_id.as_str()) else {
                     return Err(IambError::InvalidUserId(user_id).into());
-                }
+                };
+
+                return verifications::iamb_verify_request(user_id, store).await;
             },
         };
 
@@ -651,6 +653,15 @@ impl Application {
 
                 Ok(vec![(action.into(), ctx)])
             },
+            HomeserverAction::KnockSend(alias, reason) => {
+                let _ = self
+                    .worker
+                    .client
+                    .knock(alias, reason, vec![])
+                    .await
+                    .map_err(IambError::from)?;
+                Ok(vec![])
+            },
             HomeserverAction::Logout(user, true) => {
                 self.worker.logout(user)?;
                 let flags = CloseFlags::QUIT | CloseFlags::FORCE;
@@ -672,6 +683,56 @@ impl Application {
                     room.forget().await.map_err(IambError::from)?;
                 }
                 Ok(vec![])
+            },
+            HomeserverAction::ProfileFieldSet(value) => {
+                let client = &store.application.worker.client;
+                let account = client.account();
+                account.set_profile_field(value).await.map_err(IambError::from)?;
+                Ok(vec![])
+            },
+            HomeserverAction::ProfileFieldUnset(field) => {
+                let client = &store.application.worker.client;
+                let account = client.account();
+                account.delete_profile_field(field).await.map_err(IambError::from)?;
+                Ok(vec![])
+            },
+            HomeserverAction::ProfileFieldShow(field) => {
+                let client = &store.application.worker.client;
+                let user_id = store.application.settings.profile.user_id.clone();
+                let account = client.account();
+                let value = account
+                    .fetch_profile_field_of(user_id, field.clone())
+                    .await
+                    .map_err(IambError::from)?;
+
+                let msg = match (field, value) {
+                    (_, Some(ProfileFieldValue::DisplayName(s))) => {
+                        format!("Your profile's display name is set to: {s}")
+                    },
+                    (_, Some(ProfileFieldValue::TimeZone(s))) => {
+                        format!("Your profile's timezone is set to: {s}")
+                    },
+                    (_, Some(ProfileFieldValue::AvatarUrl(s))) => {
+                        format!("Your profile's avatar URL is set to: {s}")
+                    },
+                    (ProfileFieldName::DisplayName, None) => {
+                        "Your profile's display name is currently unset".into()
+                    },
+                    (ProfileFieldName::TimeZone, None) => {
+                        "Your profile's timezone is currently unset".into()
+                    },
+                    (ProfileFieldName::AvatarUrl, None) => {
+                        "Your profile's avatar URL is currently unset".into()
+                    },
+                    (f, None) => {
+                        format!("Your profile's {f:?} is currently unset")
+                    },
+                    (f, Some(s)) => {
+                        format!("Your profile's {f:?} is set to {s:?}")
+                    },
+                };
+
+                Ok(vec![(Action::ShowInfoMessage(msg.into()), ctx)])
             },
         }
     }

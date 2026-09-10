@@ -6,7 +6,7 @@
 //! Additionally, some of the iamb commands delegate behaviour to the current UI element. For
 //! example, [sending messages][crate::base::SendAction] delegate to the [room window][RoomState],
 //! where we have the message bar and room ID easily accessible and resettable.
-use std::cmp::{Ord, Ordering, PartialOrd};
+use std::cmp::{Ord, Ordering};
 use std::fmt::{self, Display};
 use std::ops::Deref;
 use std::sync::Arc;
@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 
 use matrix_sdk::{
     RoomState as MatrixRoomState,
-    encryption::verification::{SasVerification, format_emojis},
     room::{Room as MatrixRoom, RoomMember},
     ruma::{
         OwnedRoomAliasId,
@@ -81,11 +80,14 @@ use crate::base::{
 use crate::config::ListColorValues;
 use crate::windows::room::room_command;
 
-use self::{room::RoomState, welcome::WelcomeState};
+use self::room::RoomState;
+use self::verify::VerifyItem;
+use self::welcome::WelcomeState;
 use crate::message::MessageTimeStamp;
 use feruca::Collator;
 
 pub mod room;
+pub mod verify;
 pub mod welcome;
 
 type MatrixRoomInfo = Arc<(MatrixRoom, Option<Tags>)>;
@@ -108,7 +110,7 @@ fn bold_spans(s: &str) -> Line<'_> {
 }
 
 #[inline]
-fn selected_style(selected: bool) -> Style {
+pub fn selected_style(selected: bool) -> Style {
     if selected {
         Style::default().add_modifier(StyleModifier::REVERSED)
     } else {
@@ -137,6 +139,7 @@ fn with_fg(style: Style, color: Option<Color>) -> Style {
 fn name_and_labels<'a>(
     name: &'a str,
     unread: &UnreadInfo,
+    room_state: MatrixRoomState,
     style: Style,
     colors: &ListColorValues,
 ) -> (Span<'a>, Vec<Vec<Span<'static>>>) {
@@ -158,8 +161,19 @@ fn name_and_labels<'a>(
 
     let mut labels = vec![];
 
+    match room_state {
+        MatrixRoomState::Joined => {},
+        MatrixRoomState::Left => labels.push(vec![Span::styled("Left", style)]),
+        MatrixRoomState::Banned => labels.push(vec![Span::styled("Banned", style)]),
+        MatrixRoomState::Knocked => labels.push(vec![Span::styled("Knocked", style)]),
+        MatrixRoomState::Invited => labels.push(vec![Span::styled("Invited", style)]),
+    }
+
     if unread.has_mention() {
-        labels.push(vec![Span::styled("Unread Mention", with_fg(style, colors.mention))]);
+        labels.push(vec![Span::styled(
+            "Unread Mention",
+            with_fg(style, colors.mention),
+        )]);
     } else if unread.is_unread() {
         labels.push(vec![Span::styled("Unread", with_fg(style, colors.unread))]);
     }
@@ -189,6 +203,14 @@ fn user_cmp(a: &MemberItem, b: &MemberItem, field: &SortFieldUser) -> Ordering {
         SortFieldUser::UserId => a_id.cmp(b_id),
         SortFieldUser::LocalPart => a_id.localpart().cmp(b_id.localpart()),
         SortFieldUser::Server => a_id.server_name().cmp(b_id.server_name()),
+        SortFieldUser::Knock => {
+            // Sort knocks before non-knocks:
+            b.is_knock().cmp(&a.is_knock())
+        },
+        SortFieldUser::Invite => {
+            // Sort invites before non-invites:
+            b.is_invite().cmp(&a.is_invite())
+        },
         SortFieldUser::PowerLevel => {
             // Sort higher power levels towards the top of the list.
             b.member.power_level().cmp(&a.member.power_level())
@@ -560,6 +582,10 @@ impl TerminalCursor for IambWindow {
     fn get_term_cursor(&self) -> Option<TermOffset> {
         delegate!(self, w => w.get_term_cursor())
     }
+
+    fn hide_term_cursor(&self) -> bool {
+        delegate!(self, w => w.hide_term_cursor())
+    }
 }
 
 impl WindowOps<IambInfo> for IambWindow {
@@ -580,6 +606,7 @@ impl WindowOps<IambInfo> for IambWindow {
                 items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
 
                 state.set(items);
+                state.set_ignorecase(store.application.settings.tunables.ignorecase);
 
                 List::new(store)
                     .empty_message("No direct messages yet!")
@@ -604,6 +631,8 @@ impl WindowOps<IambInfo> for IambWindow {
                     *last_fetch = Some(Instant::now());
                 }
 
+                state.set_ignorecase(store.application.settings.tunables.ignorecase);
+
                 List::new(store)
                     .empty_message("No users here yet!")
                     .empty_alignment(Alignment::Center)
@@ -624,6 +653,7 @@ impl WindowOps<IambInfo> for IambWindow {
                 items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
 
                 state.set(items);
+                state.set_ignorecase(store.application.settings.tunables.ignorecase);
 
                 List::new(store)
                     .empty_message("You haven't joined any rooms yet")
@@ -656,6 +686,7 @@ impl WindowOps<IambInfo> for IambWindow {
                 items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
 
                 state.set(items);
+                state.set_ignorecase(store.application.settings.tunables.ignorecase);
 
                 List::new(store)
                     .empty_message("You do not have rooms or dms yet")
@@ -690,6 +721,7 @@ impl WindowOps<IambInfo> for IambWindow {
                 items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
 
                 state.set(items);
+                state.set_ignorecase(store.application.settings.tunables.ignorecase);
 
                 List::new(store)
                     .empty_message("You do not have any unreads yet")
@@ -724,6 +756,7 @@ impl WindowOps<IambInfo> for IambWindow {
                 items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
 
                 state.set(items);
+                state.set_ignorecase(store.application.settings.tunables.ignorecase);
 
                 List::new(store)
                     .empty_message("You do not have any unread mentions yet")
@@ -745,6 +778,7 @@ impl WindowOps<IambInfo> for IambWindow {
                 items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
 
                 state.set(items);
+                state.set_ignorecase(store.application.settings.tunables.ignorecase);
 
                 List::new(store)
                     .empty_message("You haven't joined any spaces yet")
@@ -753,13 +787,22 @@ impl WindowOps<IambInfo> for IambWindow {
                     .render(area, buf, state);
             },
             IambWindow::VerifyList(state) => {
-                let verifications = &store.application.verifications;
-                let mut items = verifications.iter().map(VerifyItem::from).collect::<Vec<_>>();
+                let mut items = store
+                    .application
+                    .verifications
+                    .iter()
+                    .map(|(_, req)| VerifyItem::new(req.to_owned()))
+                    .collect::<Vec<_>>();
 
                 // Sort the active verifications towards the top.
                 items.sort();
 
+                if let Some(item) = items.first_mut() {
+                    item.show_help();
+                }
+
                 state.set(items);
+                state.set_ignorecase(store.application.settings.tunables.ignorecase);
 
                 List::new(store)
                     .empty_message("No in-progress verifications")
@@ -1066,7 +1109,8 @@ impl ListItem<IambInfo> for GenericChatItem {
     ) -> Text<'_> {
         let style = selected_style(selected);
         let colors = store.application.settings.tunables.list_colors;
-        let (name, mut labels) = name_and_labels(&self.name, &self.unread, style, &colors);
+        let (name, mut labels) =
+            name_and_labels(&self.name, &self.unread, self.room().state(), style, &colors);
         let mut spans = vec![name];
 
         if self.is_dm {
@@ -1183,7 +1227,8 @@ impl ListItem<IambInfo> for RoomItem {
     ) -> Text<'_> {
         let style = selected_style(selected);
         let colors = store.application.settings.tunables.list_colors;
-        let (name, mut labels) = name_and_labels(&self.name, &self.unread, style, &colors);
+        let (name, mut labels) =
+            name_and_labels(&self.name, &self.unread, self.room().state(), style, &colors);
         let mut spans = vec![name];
 
         if let Some(tags) = &self.tags() {
@@ -1293,7 +1338,8 @@ impl ListItem<IambInfo> for DirectItem {
     ) -> Text<'_> {
         let style = selected_style(selected);
         let colors = store.application.settings.tunables.list_colors;
-        let (name, mut labels) = name_and_labels(&self.name, &self.unread, style, &colors);
+        let (name, mut labels) =
+            name_and_labels(&self.name, &self.unread, self.room().state(), style, &colors);
         let mut spans = vec![name];
 
         if let Some(tags) = &self.tags() {
@@ -1419,208 +1465,6 @@ impl Promptable<ProgramContext, ProgramStore, IambInfo> for SpaceItem {
 }
 
 #[derive(Clone)]
-pub struct VerifyItem {
-    user_dev: String,
-    sasv1: SasVerification,
-}
-
-impl VerifyItem {
-    fn new(user_dev: String, sasv1: SasVerification) -> Self {
-        VerifyItem { user_dev, sasv1 }
-    }
-
-    fn show_item(&self) -> String {
-        let state = if self.sasv1.is_done() {
-            "done"
-        } else if self.sasv1.is_cancelled() {
-            "cancelled"
-        } else if self.sasv1.emoji().is_some() {
-            "accepted"
-        } else {
-            "not accepted"
-        };
-
-        if self.sasv1.is_self_verification() {
-            let device = self.sasv1.other_device();
-
-            if let Some(display_name) = device.display_name() {
-                format!("Device verification with {display_name} ({state})")
-            } else {
-                format!("Device verification with device {} ({})", device.device_id(), state)
-            }
-        } else {
-            format!("User Verification with {} ({})", self.sasv1.other_user_id(), state)
-        }
-    }
-}
-
-impl PartialEq for VerifyItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.user_dev == other.user_dev
-    }
-}
-
-impl Eq for VerifyItem {}
-
-impl Ord for VerifyItem {
-    fn cmp(&self, other: &Self) -> Ordering {
-        fn state_val(sas: &SasVerification) -> usize {
-            if sas.is_done() {
-                return 3;
-            } else if sas.is_cancelled() {
-                return 2;
-            } else {
-                return 1;
-            }
-        }
-
-        fn device_val(sas: &SasVerification) -> usize {
-            if sas.is_self_verification() {
-                return 1;
-            } else {
-                return 2;
-            }
-        }
-
-        let state1 = state_val(&self.sasv1);
-        let state2 = state_val(&other.sasv1);
-
-        let dev1 = device_val(&self.sasv1);
-        let dev2 = device_val(&other.sasv1);
-
-        let scmp = state1.cmp(&state2);
-        let dcmp = dev1.cmp(&dev2);
-
-        scmp.then(dcmp).then_with(|| {
-            let did1 = self.sasv1.other_device().device_id();
-            let did2 = other.sasv1.other_device().device_id();
-
-            did1.cmp(did2)
-        })
-    }
-}
-
-impl PartialOrd for VerifyItem {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl From<(&String, &SasVerification)> for VerifyItem {
-    fn from((user_dev, sasv1): (&String, &SasVerification)) -> Self {
-        VerifyItem::new(user_dev.clone(), sasv1.clone())
-    }
-}
-
-impl Display for VerifyItem {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        if self.sasv1.is_done() {
-            return Ok(());
-        }
-
-        if self.sasv1.is_cancelled() {
-            write!(f, ":verify request {}", self.sasv1.other_user_id())
-        } else if self.sasv1.emoji().is_some() {
-            write!(f, ":verify confirm {}", self.user_dev)
-        } else {
-            write!(f, ":verify accept {}", self.user_dev)
-        }
-    }
-}
-
-impl ListItem<IambInfo> for VerifyItem {
-    fn show(
-        &self,
-        selected: bool,
-        _: &ViewportContext<ListCursor>,
-        _: &mut ProgramStore,
-    ) -> Text<'_> {
-        let mut lines = vec![];
-
-        let bold = Style::default().add_modifier(StyleModifier::BOLD);
-        let item = Span::styled(self.show_item(), selected_style(selected));
-        lines.push(Line::from(item));
-
-        if self.sasv1.is_done() {
-            // Print nothing.
-        } else if self.sasv1.is_cancelled() {
-            if let Some(info) = self.sasv1.cancel_info() {
-                lines.push(Line::from(format!("    Cancelled: {}", info.reason())));
-                lines.push(Line::from(""));
-            }
-
-            lines.push(Line::from("    You can start a new verification request with:"));
-        } else if let Some(emoji) = self.sasv1.emoji() {
-            lines.push(Line::from(
-                "    Both devices should see the following Emoji sequence:".to_string(),
-            ));
-            lines.push(Line::from(""));
-
-            for line in format_emojis(emoji).lines() {
-                lines.push(Line::from(format!("    {line}")));
-            }
-
-            lines.push(Line::from(""));
-            lines.push(Line::from("    If they don't match, run:"));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                format!(":verify mismatch {}", self.user_dev),
-                bold,
-            )));
-            lines.push(Line::from(""));
-            lines.push(Line::from("    If everything looks right, you can confirm with:"));
-        } else {
-            lines.push(Line::from("    To accept this request, run:"));
-        }
-
-        let cmd = self.to_string();
-
-        if !cmd.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![Span::from("        "), Span::styled(cmd, bold)]));
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::from("You can copy the above command with "),
-                Span::styled("yy", bold),
-                Span::from(" and then execute it with "),
-                Span::styled("@\"", bold),
-            ]));
-        }
-
-        Text::from(lines)
-    }
-
-    fn get_word(&self) -> Option<String> {
-        None
-    }
-}
-
-impl Promptable<ProgramContext, ProgramStore, IambInfo> for VerifyItem {
-    fn prompt(
-        &mut self,
-        act: &PromptAction,
-        _: &ProgramContext,
-        _: &mut ProgramStore,
-    ) -> EditResult<Vec<(ProgramAction, ProgramContext)>, IambInfo> {
-        match act {
-            PromptAction::Submit => Ok(vec![]),
-            PromptAction::Abort(_) => {
-                let msg = "Cannot abort entry inside a list";
-                let err = EditError::Failure(msg.into());
-
-                Err(err)
-            },
-            PromptAction::Recall(..) => {
-                let msg = "Cannot recall history inside a list";
-                let err = EditError::Failure(msg.into());
-
-                Err(err)
-            },
-        }
-    }
-}
-
-#[derive(Clone)]
 pub struct MemberItem {
     member: RoomMember,
     room_id: OwnedRoomId,
@@ -1629,6 +1473,14 @@ pub struct MemberItem {
 impl MemberItem {
     fn new(member: RoomMember, room_id: OwnedRoomId) -> Self {
         Self { member, room_id }
+    }
+
+    fn is_knock(&self) -> bool {
+        self.member.membership() == &MembershipState::Knock
+    }
+
+    fn is_invite(&self) -> bool {
+        self.member.membership() == &MembershipState::Invite
     }
 }
 
@@ -2076,10 +1928,28 @@ mod tests {
             unread: Some(Color::LightYellow),
             ..Default::default()
         };
-        let (name, labels) =
-            name_and_labels("hello", &unread_info(0, 0), Style::default(), &colors);
+        let (name, labels) = name_and_labels(
+            "hello",
+            &unread_info(0, 0),
+            MatrixRoomState::Joined,
+            Style::default(),
+            &colors,
+        );
         assert_eq!(name, Span::raw("hello"));
         assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn test_name_and_labels_room_state() {
+        let (_, labels) = name_and_labels(
+            "hello",
+            &unread_info(0, 0),
+            MatrixRoomState::Left,
+            Style::default(),
+            &ListColorValues::default(),
+        );
+
+        assert_eq!(labels, vec![vec![Span::raw("Left")]]);
     }
 
     #[test]
@@ -2090,13 +1960,11 @@ mod tests {
             ..Default::default()
         };
         let style = Style::default();
-        let (name, labels) = name_and_labels("hello", &unread_info(1, 0), style, &colors);
+        let (name, labels) =
+            name_and_labels("hello", &unread_info(1, 0), MatrixRoomState::Joined, style, &colors);
         assert_eq!(
             name,
-            Span::styled(
-                "hello",
-                style.fg(Color::LightYellow).add_modifier(StyleModifier::BOLD)
-            )
+            Span::styled("hello", style.fg(Color::LightYellow).add_modifier(StyleModifier::BOLD))
         );
         assert_eq!(labels, vec![vec![Span::styled("Unread", style.fg(Color::LightYellow))]]);
     }
@@ -2109,36 +1977,43 @@ mod tests {
             ..Default::default()
         };
         let style = Style::default();
-        let (name, labels) = name_and_labels("hello", &unread_info(3, 1), style, &colors);
+        let (name, labels) =
+            name_and_labels("hello", &unread_info(3, 1), MatrixRoomState::Joined, style, &colors);
         assert_eq!(
             name,
             Span::styled("hello", style.fg(Color::LightRed).add_modifier(StyleModifier::BOLD))
         );
-        assert_eq!(
-            labels,
-            vec![vec![Span::styled("Unread Mention", style.fg(Color::LightRed))]]
-        );
+        assert_eq!(labels, vec![vec![Span::styled(
+            "Unread Mention",
+            style.fg(Color::LightRed)
+        )]]);
     }
 
     #[test]
     fn test_name_and_labels_selected_keeps_reverse() {
-        let colors = ListColorValues { unread: Some(Color::LightYellow), ..Default::default() };
+        let colors = ListColorValues {
+            unread: Some(Color::LightYellow),
+            ..Default::default()
+        };
         let style = selected_style(true);
-        let (name, _) = name_and_labels("hello", &unread_info(1, 0), style, &colors);
+        let (name, _) =
+            name_and_labels("hello", &unread_info(1, 0), MatrixRoomState::Joined, style, &colors);
         assert_eq!(
             name,
-            Span::styled(
-                "hello",
-                style.fg(Color::LightYellow).add_modifier(StyleModifier::BOLD)
-            )
+            Span::styled("hello", style.fg(Color::LightYellow).add_modifier(StyleModifier::BOLD))
         );
         assert!(name.style.add_modifier.contains(StyleModifier::REVERSED));
     }
 
     #[test]
     fn test_name_and_labels_without_config_stays_bold_only() {
-        let (name, labels) =
-            name_and_labels("hello", &unread_info(1, 0), Style::default(), &ListColorValues::default());
+        let (name, labels) = name_and_labels(
+            "hello",
+            &unread_info(1, 0),
+            MatrixRoomState::Joined,
+            Style::default(),
+            &ListColorValues::default(),
+        );
         assert_eq!(name, Span::styled("hello", Style::default().add_modifier(StyleModifier::BOLD)));
         assert_eq!(labels, vec![vec![Span::styled("Unread", Style::default())]]);
     }
