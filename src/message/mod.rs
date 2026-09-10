@@ -1061,6 +1061,7 @@ impl Message {
                 .values()
                 .filter_map(|receipts| self.event.event_id().and_then(|id| receipts.get(id)))
                 .flat_map(|read| read.iter())
+                .filter(|user_id| *user_id != &settings.profile.user_id)
                 .map(|user_id| settings.get_user_char_span(user_id, info))
                 .collect();
 
@@ -1432,6 +1433,34 @@ pub mod tests {
 
     use super::*;
     use crate::tests::*;
+
+    fn read_receipt_count(
+        message: &Message,
+        info: &RoomInfo,
+        settings: &ApplicationSettings,
+    ) -> usize {
+        message.get_render_format(None, 100, info, settings).read.len()
+    }
+
+    #[test]
+    fn test_own_read_receipts_are_hidden() {
+        let settings = mock_settings();
+        let mut info = mock_room();
+        let user_id = settings.profile.user_id.clone();
+        info.set_receipt(ReceiptThread::Main, user_id.clone(), MSG1_EVID.clone());
+        info.set_receipt(ReceiptThread::Unthreaded, user_id, MSG1_EVID.clone());
+
+        assert_eq!(read_receipt_count(&mock_message1(), &info, &settings), 0);
+    }
+
+    #[test]
+    fn test_other_read_receipts_remain_visible() {
+        let settings = mock_settings();
+        let mut info = mock_room();
+        info.set_receipt(ReceiptThread::Main, TEST_USER1.clone(), MSG1_EVID.clone());
+
+        assert_eq!(read_receipt_count(&mock_message1(), &info, &settings), 1);
+    }
 
     #[test]
     fn test_mc_cmp() {
