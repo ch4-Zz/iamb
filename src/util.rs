@@ -1,12 +1,24 @@
 //! # Utility functions
-use std::borrow::Cow;
 
+use std::io::stdout;
+
+use modalkit::crossterm;
+use modalkit::crossterm::cursor::{SetCursorStyle, Show as CursorShow};
+use modalkit::crossterm::event::{
+    DisableBracketedPaste,
+    DisableFocusChange,
+    DisableMouseCapture,
+    EnableBracketedPaste,
+    EnableFocusChange,
+    EnableMouseCapture,
+    KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
+use modalkit::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, SetTitle};
 use regex::{Regex, RegexBuilder};
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
-use ratatui::style::Style;
-use ratatui::text::{Line, Span, Text};
+use crate::prelude::*;
 
 pub fn split_cow(cow: Cow<'_, str>, idx: usize) -> (Cow<'_, str>, Cow<'_, str>) {
     match cow {
@@ -24,12 +36,11 @@ pub fn split_cow(cow: Cow<'_, str>, idx: usize) -> (Cow<'_, str>, Cow<'_, str>) 
         },
     }
 }
-
 pub fn take_width(s: Cow<'_, str>, width: usize) -> ((Cow<'_, str>, usize), Cow<'_, str>) {
     // Find where to split the line.
     let mut cur_width = 0;
 
-    let mut idx = UnicodeSegmentation::split_word_bound_indices(s.as_ref())
+    let idx = UnicodeSegmentation::split_word_bound_indices(s.as_ref())
         .find_map(|(i, word)| {
             let word_width = UnicodeWidthStr::width(word);
             if cur_width + word_width > width {
@@ -43,21 +54,29 @@ pub fn take_width(s: Cow<'_, str>, width: usize) -> ((Cow<'_, str>, usize), Cow<
 
     if idx == 0 {
         // first word is wider than available; fall back to splitting by width
-        idx = UnicodeSegmentation::grapheme_indices(s.as_ref(), true)
-            .find_map(|(i, graph)| {
-                let graph_width = UnicodeWidthStr::width(graph);
-                if cur_width + graph_width > width {
-                    Some(i)
-                } else {
-                    cur_width += graph_width;
-                    None
-                }
-            })
-            .unwrap_or(s.len());
+        return take_width_grapheme(s, width);
     }
 
     let (s0, s1) = split_cow(s, idx);
 
+    ((s0, cur_width), s1)
+}
+
+pub fn take_width_grapheme(s: Cow<'_, str>, width: usize) -> ((Cow<'_, str>, usize), Cow<'_, str>) {
+    let mut cur_width = 0;
+    let idx = UnicodeSegmentation::grapheme_indices(s.as_ref(), true)
+        .find_map(|(i, graph)| {
+            let graph_width = UnicodeWidthStr::width(graph);
+            if cur_width + graph_width > width {
+                Some(i)
+            } else {
+                cur_width += graph_width;
+                None
+            }
+        })
+        .unwrap_or(s.len());
+
+    let (s0, s1) = split_cow(s, idx);
     ((s0, cur_width), s1)
 }
 
@@ -186,6 +205,86 @@ pub fn replace_emojis_in_line(line: &mut Line) {
 /// Compile a search pattern, optionally ignoring case.
 pub fn compile_search(pattern: &str, case_insensitive: bool) -> Result<Regex, regex::Error> {
     RegexBuilder::new(pattern).case_insensitive(case_insensitive).build()
+}
+
+/// Set up the terminal for drawing the TUI, and getting additional info.
+pub fn setup_tty(settings: &ApplicationSettings) -> std::io::Result<()> {
+    // Enable raw mode and enter the alternate screen.
+    crossterm::terminal::enable_raw_mode()?;
+    crossterm::execute!(stdout(), EnterAlternateScreen)?;
+
+    if settings.enable_enhanced_keys {
+        // Enable the Kitty keyboard enhancement protocol for improved keypresses.
+        crossterm::queue!(
+            stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+
+    if settings.tunables.mouse.enabled {
+        crossterm::execute!(stdout(), EnableMouseCapture)?;
+    }
+
+    if settings.tunables.terminal.enable_title {
+        let title = format!("iamb ({})", settings.profile.user_id.as_str());
+        crossterm::execute!(stdout(), SetTitle(title))?;
+    }
+
+    let cursor_shape = SetCursorStyle::from(settings.tunables.terminal.cursor_shape);
+
+    crossterm::execute!(stdout(), EnableBracketedPaste, EnableFocusChange, cursor_shape)
+}
+
+// Do our best to reverse what we did in setup_tty() when we exit or crash.
+pub fn restore_tty(enable_enhanced_keys: bool, enable_mouse: bool) {
+    // The keyboard enhancement flags were pushed onto the alternate screen's
+    // stack, which the terminal keeps separate from the main screen's, so they
+    // have to be popped before LeaveAlternateScreen below.
+    if enable_enhanced_keys {
+        let _ = crossterm::queue!(stdout(), PopKeyboardEnhancementFlags);
+    }
+
+    if enable_mouse {
+        let _ = crossterm::queue!(stdout(), DisableMouseCapture);
+    }
+
+    let _ = crossterm::execute!(
+        stdout(),
+        DisableBracketedPaste,
+        DisableFocusChange,
+        SetCursorStyle::DefaultUserShape,
+        LeaveAlternateScreen,
+        CursorShow,
+    );
+
+    let _ = crossterm::terminal::disable_raw_mode();
+}
+
+/// Hands the terminal back to an external program, and sets it up for the TUI
+/// again when dropped.
+///
+/// Programs that use the alternate screen themselves (editors, pagers) leave it
+/// on exit, which drops us back to the main screen without iamb knowing, and the
+/// TUI then draws over the user's scrollback. Suspending around the child keeps
+/// the alternate screen entries and exits balanced.
+pub struct SuspendedTty<'a> {
+    settings: &'a ApplicationSettings,
+}
+
+impl<'a> SuspendedTty<'a> {
+    pub fn new(settings: &'a ApplicationSettings) -> Self {
+        restore_tty(settings.enable_enhanced_keys, settings.tunables.mouse.enabled);
+
+        SuspendedTty { settings }
+    }
+}
+
+impl Drop for SuspendedTty<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = setup_tty(self.settings) {
+            tracing::error!(err = %e, "Failed to set the terminal back up after an external program");
+        }
+    }
 }
 
 #[cfg(test)]

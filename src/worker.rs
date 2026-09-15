@@ -2,116 +2,83 @@
 //!
 //! The worker thread handles asynchronous work, and can receive messages from the main thread that
 //! block on a reply from the async worker.
-use std::collections::HashMap;
-use std::convert::TryFrom;
-use std::fmt::{Debug, Formatter};
-use std::ops::DerefMut;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::time::{Duration, Instant};
 
-use futures::{StreamExt, stream::FuturesUnordered};
+use std::fmt::{Debug, Formatter};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use gethostname::gethostname;
+use matrix_sdk::OwnedServerName;
+use matrix_sdk::authentication::matrix::MatrixSession;
+use matrix_sdk::config::{RequestConfig, SyncSettings};
+use matrix_sdk::encryption::{BackupDownloadStrategy, EncryptionSettings};
+use matrix_sdk::event_handler::Ctx;
+use matrix_sdk::room::{Messages as MatrixMessages, MessagesOptions, RoomMember};
+use matrix_sdk::ruma::OwnedRoomAliasId;
+use matrix_sdk::ruma::api::client::filter::{
+    FilterDefinition,
+    LazyLoadOptions,
+    RoomEventFilter,
+    RoomFilter,
+};
+use matrix_sdk::ruma::api::client::room::Visibility;
+use matrix_sdk::ruma::api::client::room::create_room::v3::{
+    CreationContent,
+    Request as CreateRoomRequest,
+};
+use matrix_sdk::ruma::api::client::space::get_hierarchy::v1::Request as SpaceHierarchyRequest;
+use matrix_sdk::ruma::assign;
 use matrix_sdk::ruma::events::key::verification::ready::{
     OriginalSyncKeyVerificationReadyEvent,
     ToDeviceKeyVerificationReadyEvent,
 };
+use matrix_sdk::ruma::events::key::verification::request::ToDeviceKeyVerificationRequestEvent;
+use matrix_sdk::ruma::events::key::verification::start::{
+    OriginalSyncKeyVerificationStartEvent,
+    ToDeviceKeyVerificationStartEvent,
+};
+use matrix_sdk::ruma::events::presence::PresenceEvent;
+use matrix_sdk::ruma::events::reaction::ReactionEventContent;
+use matrix_sdk::ruma::events::receipt::{ReceiptEventContent, ReceiptType};
+use matrix_sdk::ruma::events::room::encryption::RoomEncryptionEventContent;
+use matrix_sdk::ruma::events::room::member::{MembershipState, OriginalSyncRoomMemberEvent};
+use matrix_sdk::ruma::events::room::name::RoomNameEventContent;
+use matrix_sdk::ruma::events::room::redaction::OriginalSyncRoomRedactionEvent;
+use matrix_sdk::ruma::events::sticker::StickerEventContent;
+use matrix_sdk::ruma::events::typing::SyncTypingEvent;
+use matrix_sdk::ruma::events::{
+    AnyMessageLikeEvent,
+    AnyMessageLikeEventContent,
+    AnyTimelineEvent,
+    InitialStateEvent,
+    SyncEphemeralRoomEvent,
+    SyncMessageLikeEvent,
+    SyncStateEvent,
+};
+use matrix_sdk::ruma::room::RoomType;
+use matrix_sdk::ruma::serde::Raw;
+use matrix_sdk::send_queue::{LocalEcho, LocalEchoContent, RoomSendQueueUpdate, SendQueueUpdate};
+use matrix_sdk::{
+    ClientBuildError,
+    Error as MatrixError,
+    RoomDisplayName,
+    RoomMemberships,
+    reqwest,
+};
 use matrix_sdk_base::RoomStateFilter;
-use ratatui::layout::Size;
 use ratatui_image::picker::Picker;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
 use tracing::{Instrument as _, error, warn};
-use url::Url;
 
-use matrix_sdk::{
-    Client,
-    ClientBuildError,
-    Error as MatrixError,
-    RoomDisplayName,
-    RoomMemberships,
-    authentication::matrix::MatrixSession,
-    config::{RequestConfig, SyncSettings},
-    encryption::{BackupDownloadStrategy, EncryptionSettings},
-    event_handler::Ctx,
-    reqwest,
-    room::{Messages, MessagesOptions, Room as MatrixRoom, RoomMember},
-    ruma::{
-        EventId,
-        OwnedEventId,
-        OwnedRoomId,
-        OwnedRoomOrAliasId,
-        OwnedUserId,
-        RoomId,
-        api::client::{
-            filter::{FilterDefinition, LazyLoadOptions, RoomEventFilter, RoomFilter},
-            room::{
-                Visibility,
-                create_room::v3::{CreationContent, Request as CreateRoomRequest},
-            },
-            space::get_hierarchy::v1::Request as SpaceHierarchyRequest,
-        },
-        assign,
-        events::{
-            AnyMessageLikeEvent,
-            AnyMessageLikeEventContent,
-            AnySyncStateEvent,
-            AnyTimelineEvent,
-            InitialStateEvent,
-            SyncEphemeralRoomEvent,
-            SyncMessageLikeEvent,
-            SyncStateEvent,
-            key::verification::{
-                request::ToDeviceKeyVerificationRequestEvent,
-                start::{OriginalSyncKeyVerificationStartEvent, ToDeviceKeyVerificationStartEvent},
-            },
-            presence::PresenceEvent,
-            reaction::ReactionEventContent,
-            receipt::{ReceiptEventContent, ReceiptThread, ReceiptType},
-            relation::Thread,
-            room::{
-                MediaSource,
-                encryption::RoomEncryptionEventContent,
-                member::OriginalSyncRoomMemberEvent,
-                message::{MessageType, Relation, RoomMessageEventContent},
-                name::RoomNameEventContent,
-                redaction::OriginalSyncRoomRedactionEvent,
-            },
-            sticker::StickerEventContent,
-            tag::Tags,
-            typing::SyncTypingEvent,
-        },
-        room::RoomType,
-        serde::Raw,
-    },
-    send_queue::{LocalEcho, LocalEchoContent, RoomSendQueueUpdate, SendQueueUpdate},
-};
-
-use modalkit::errors::UIError;
-use modalkit::prelude::{EditInfo, InfoMessage};
-
-use crate::base::{EchoLocation, MessageNeed};
+use crate::base::{CreateRoomFlags, CreateRoomType, EchoLocation, MessageNeed, RoomFetchStatus};
 use crate::config::ProxyUrl;
-use crate::message::{Message, MessageEvent, MessageId, MessageKey};
+use crate::message::MessageId;
 use crate::notifications::register_notifications;
-use crate::preview::PreviewKind;
+use crate::prelude::*;
 use crate::verifications;
-use crate::{
-    ApplicationSettings,
-    base::{
-        AsyncProgramStore,
-        ChatStore,
-        CreateRoomFlags,
-        CreateRoomType,
-        IambError,
-        IambResult,
-        ProgramStore,
-        RoomFetchStatus,
-        RoomInfo,
-    },
-};
 
 const DEFAULT_ENCRYPTION_SETTINGS: EncryptionSettings = EncryptionSettings {
     auto_enable_cross_signing: true,
@@ -265,7 +232,8 @@ async fn load_older_one(
         };
         opts.limit = limit.into();
 
-        let Messages { end, chunk, .. } = room.messages(opts).await.map_err(IambError::from)?;
+        let MatrixMessages { end, chunk, .. } =
+            room.messages(opts).await.map_err(IambError::from)?;
 
         let mut msgs = vec![];
 
@@ -302,7 +270,7 @@ fn load_insert(
     locked: &mut ProgramStore,
     message_needs: Vec<MessageNeed>,
 ) {
-    let ChatStore { presences, rooms, previews, settings, worker, .. } = &mut locked.application;
+    let ChatStore { presences, rooms, previews, settings, .. } = &mut locked.application;
     let info = rooms.get_or_default(room_id.clone());
     info.fetching = false;
 
@@ -321,13 +289,13 @@ fn load_insert(
                         info.insert_encrypted(msg);
                     },
                     AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::RoomMessage(msg)) => {
-                        info.insert_with_preview(msg, settings, previews, worker);
+                        info.insert_with_preview(msg, settings, previews);
                     },
                     AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::Reaction(ev)) => {
-                        info.insert_reaction_with_preview(ev, settings, previews, worker);
+                        info.insert_reaction_with_preview(ev, settings, previews);
                     },
                     AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::Sticker(ev)) => {
-                        info.insert_sticker_with_preview(ev, settings, previews, worker);
+                        info.insert_sticker_with_preview(ev, settings, previews);
                     },
                     AnyTimelineEvent::MessageLike(_) => {
                         continue;
@@ -394,6 +362,10 @@ async fn members_load(client: &Client, room_id: &RoomId) -> IambResult<Vec<RoomM
     }
 }
 
+fn member_active(state: &MembershipState) -> bool {
+    matches!(state, MembershipState::Invite | MembershipState::Join)
+}
+
 fn members_insert(
     room_id: OwnedRoomId,
     res: IambResult<Vec<RoomMember>>,
@@ -406,7 +378,9 @@ fn members_insert(
         for member in members {
             let user_id = member.user_id().to_owned();
             let name = member.display_name().map(|s| s.to_owned());
-            info.display_names.set(user_id, name);
+            let is_active = member_active(member.membership());
+
+            info.display_names.set(user_id, name, is_active);
         }
     }
     // else ???
@@ -733,7 +707,8 @@ pub enum WorkerTask {
     Logout(String, ClientReply<IambResult<EditInfo>>),
     GetInviter(MatrixRoom, ClientReply<IambResult<Option<RoomMember>>>),
     GetRoom(OwnedRoomId, ClientReply<IambResult<FetchedRoom>>),
-    JoinRoom(String, ClientReply<IambResult<OwnedRoomId>>),
+    ResolveAlias(OwnedRoomAliasId, ClientReply<IambResult<OwnedRoomId>>),
+    JoinRoom(String, Vec<OwnedServerName>, ClientReply<IambResult<OwnedRoomId>>),
     Members(OwnedRoomId, ClientReply<IambResult<Vec<RoomMember>>>),
     SpaceMembers(OwnedRoomId, ClientReply<IambResult<Vec<OwnedRoomId>>>),
     TypingNotice(OwnedRoomId),
@@ -767,9 +742,16 @@ impl Debug for WorkerTask {
                     .field(&format_args!("_"))
                     .finish()
             },
-            WorkerTask::JoinRoom(s, _) => {
+            WorkerTask::ResolveAlias(s, _) => {
+                f.debug_tuple("WorkerTask::ResolveAlias")
+                    .field(s)
+                    .field(&format_args!("_"))
+                    .finish()
+            },
+            WorkerTask::JoinRoom(s, via, _) => {
                 f.debug_tuple("WorkerTask::JoinRoom")
                     .field(s)
+                    .field(via)
                     .field(&format_args!("_"))
                     .finish()
             },
@@ -852,7 +834,11 @@ async fn create_client_inner(
     // Set up the Matrix client for the selected profile.
     let builder = Client::builder()
         .http_client(http)
-        .sqlite_store(settings.sqlite_dir.as_path(), None)
+        .sqlite_store_with_cache_path(
+            settings.sqlite_dir.as_path(),
+            settings.sqlite_cache_dir.as_path(),
+            None,
+        )
         .request_config(req_config)
         .with_encryption_settings(DEFAULT_ENCRYPTION_SETTINGS);
 
@@ -939,10 +925,18 @@ impl Requester {
         return response.recv();
     }
 
-    pub fn join_room(&self, name: String) -> IambResult<OwnedRoomId> {
+    pub fn resolve_alias(&self, alias_id: OwnedRoomAliasId) -> IambResult<OwnedRoomId> {
         let (reply, response) = oneshot();
 
-        self.tx.send(WorkerTask::JoinRoom(name, reply)).unwrap();
+        self.tx.send(WorkerTask::ResolveAlias(alias_id, reply)).unwrap();
+
+        return response.recv();
+    }
+
+    pub fn join_room(&self, name: String, via: Vec<OwnedServerName>) -> IambResult<OwnedRoomId> {
+        let (reply, response) = oneshot();
+
+        self.tx.send(WorkerTask::JoinRoom(name, via, reply)).unwrap();
 
         return response.recv();
     }
@@ -1036,9 +1030,13 @@ impl ClientWorker {
                 self.init(store).await;
                 reply.send(());
             },
-            WorkerTask::JoinRoom(room_id, reply) => {
+            WorkerTask::ResolveAlias(alias_id, reply) => {
                 assert!(self.initialized);
-                reply.send(self.join_room(room_id).await);
+                reply.send(self.resolve_alias(alias_id).await);
+            },
+            WorkerTask::JoinRoom(name, via, reply) => {
+                assert!(self.initialized);
+                reply.send(self.join_room(name, via).await);
             },
             WorkerTask::GetInviter(invited, reply) => {
                 assert!(self.initialized);
@@ -1155,14 +1153,13 @@ impl ClientWorker {
                     let sender = ev.sender().to_owned();
                     let _ = locked.application.presences.get_or_default(sender);
 
-                    let ChatStore { rooms, previews, settings, worker, .. } =
-                        &mut locked.application;
+                    let ChatStore { rooms, previews, settings, .. } = &mut locked.application;
                     let info = rooms.get_or_default(room_id.to_owned());
 
                     update_event_receipts(info, &room, ev.event_id()).await;
 
                     let full_ev = ev.into_full_event(room_id.to_owned());
-                    info.insert_with_preview(full_ev, settings, previews, worker);
+                    info.insert_with_preview(full_ev, settings, previews);
                 }
             },
         );
@@ -1179,8 +1176,7 @@ impl ClientWorker {
                     let sender = ev.sender().to_owned();
                     let _ = locked.application.presences.get_or_default(sender);
 
-                    let ChatStore { rooms, previews, settings, worker, .. } =
-                        &mut locked.application;
+                    let ChatStore { rooms, previews, settings, .. } = &mut locked.application;
                     let info = rooms.get_or_default(room_id.to_owned());
 
                     update_event_receipts(info, &room, ev.event_id()).await;
@@ -1189,7 +1185,6 @@ impl ClientWorker {
                         ev.into_full_event(room_id.to_owned()),
                         settings,
                         previews,
-                        worker,
                     );
                 }
             },
@@ -1207,15 +1202,14 @@ impl ClientWorker {
                     let sender = ev.sender().to_owned();
                     let _ = locked.application.presences.get_or_default(sender);
 
-                    let ChatStore { rooms, settings, previews, worker, .. } =
-                        &mut locked.application;
+                    let ChatStore { rooms, settings, previews, .. } = &mut locked.application;
 
                     let info = rooms.get_or_default(room_id.to_owned());
 
                     update_event_receipts(info, &room, ev.event_id()).await;
 
                     let full_ev = ev.into_full_event(room_id.to_owned());
-                    info.insert_sticker_with_preview(full_ev, settings, previews, worker);
+                    info.insert_sticker_with_preview(full_ev, settings, previews);
                 }
             },
         );
@@ -1282,7 +1276,8 @@ impl ClientWorker {
 
                     let mut locked = store.lock().await;
                     let info = locked.application.get_room_info(room_id.to_owned());
-                    info.display_names.set(user_id, ev.content.displayname);
+                    let is_active = member_active(&ev.content.membership);
+                    info.display_names.set(user_id, ev.content.displayname, is_active);
                 }
             },
         );
@@ -1510,7 +1505,11 @@ impl ClientWorker {
 
     async fn get_room(&mut self, room_id: OwnedRoomId) -> IambResult<FetchedRoom> {
         if let Some(room) = self.client.get_room(&room_id) {
-            let name = room.cached_display_name().ok_or_else(|| IambError::UnknownRoom(room_id))?;
+            let name = if let Some(name) = room.cached_display_name() {
+                name
+            } else {
+                room.display_name().await.map_err(IambError::from)?
+            };
             let tags = room.tags().await.map_err(IambError::from)?;
 
             Ok((room, name, tags))
@@ -1519,9 +1518,25 @@ impl ClientWorker {
         }
     }
 
-    async fn join_room(&mut self, name: String) -> IambResult<OwnedRoomId> {
+    async fn resolve_alias(&mut self, alias_id: OwnedRoomAliasId) -> IambResult<OwnedRoomId> {
+        match self.client.resolve_room_alias(&alias_id).await {
+            Ok(resp) => Ok(resp.room_id),
+            Err(e) => {
+                let msg = e.to_string();
+                let err = UIError::Failure(msg);
+
+                return Err(err);
+            },
+        }
+    }
+
+    async fn join_room(
+        &mut self,
+        name: String,
+        via: Vec<OwnedServerName>,
+    ) -> IambResult<OwnedRoomId> {
         if let Ok(alias_id) = OwnedRoomOrAliasId::from_str(name.as_str()) {
-            match self.client.join_room_by_id_or_alias(&alias_id, &[]).await {
+            match self.client.join_room_by_id_or_alias(&alias_id, &via).await {
                 Ok(resp) => Ok(resp.room_id().to_owned()),
                 Err(e) => {
                     let msg = e.to_string();

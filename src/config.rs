@@ -1,44 +1,30 @@
 //! # Logic for loading and validating application configuration
-use std::borrow::Cow;
+
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::fmt;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::{BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::io::{BufReader, BufWriter, Write as _};
 use std::process;
-use std::str::FromStr;
 
 use clap::Parser;
+use lazy_static::lazy_static;
 use matrix_sdk::EncryptionState;
 use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::media::MediaRetentionPolicy;
 use matrix_sdk::reqwest::header::{HeaderMap, HeaderValue};
-use matrix_sdk::ruma::{OwnedDeviceId, OwnedRoomAliasId, OwnedRoomId, OwnedUserId, UserId};
-use ratatui::layout::Size;
-use ratatui::style::{Color, Modifier as StyleModifier, Style};
-use ratatui::text::Span;
+use matrix_sdk::ruma::{OwnedDeviceId, owned_server_name};
+use modalkit::crossterm;
+use modalkit::env::vim::VimMode;
+use modalkit::keybindings::InputKey;
 use ratatui_image::FilterType;
 use ratatui_image::picker::ProtocolType;
-use serde::{Deserialize, Deserializer, Serialize, de::Error as SerdeError, de::Visitor};
-use url::Url;
+use serde::de::Error as SerdeError;
+use serde::de::Visitor;
+use serde::{Deserialize, Deserializer, Serialize};
 
-use modalkit::env::vim::VimMode;
-use modalkit::key::TerminalKey;
-use modalkit::keybindings::InputKey;
-use modalkit::prelude::Axis;
-
-use super::base::{
-    IambError,
-    IambId,
-    RoomInfo,
-    SortColumn,
-    SortFieldRoom,
-    SortFieldUser,
-    SortOrder,
-};
+use crate::base::{SortColumn, SortFieldRoom, SortFieldUser, SortOrder};
+use crate::prelude::*;
 
 type Macros = HashMap<VimModes, HashMap<Keys, Keys>>;
 
@@ -47,6 +33,10 @@ macro_rules! usage {
         println!($($args)*);
         process::exit(2);
     }
+}
+
+lazy_static! {
+    pub static ref DEFAULT_VIA_SERVER: OwnedServerName = owned_server_name!("matrix.org");
 }
 
 const DEFAULT_MEMBERS_SORT: [SortColumn<SortFieldUser>; 4] = [
@@ -65,8 +55,12 @@ const DEFAULT_ROOM_SORT: [SortColumn<SortFieldRoom>; 5] = [
 ];
 
 const DEFAULT_ENABLE_TITLE: bool = true;
-const DEFAULT_ENC_INDICATOR_LOC: EncryptionIndicatorLocation = EncryptionIndicatorLocation::PROMPT;
 const DEFAULT_REQ_TIMEOUT: u64 = 120;
+
+const DEFAULT_ENC_INDICATOR_LOC: EncryptionIndicatorLocation = EncryptionIndicatorLocation::PROMPT;
+const DEFAULT_ICON_ENC: Cow<'static, str> = Cow::Borrowed("[E] ");
+const DEFAULT_ICON_UNENC: Cow<'static, str> = Cow::Borrowed("[U] ");
+const DEFAULT_ICON_UNKNOWN: Cow<'static, str> = Cow::Borrowed("[?] ");
 
 const DEFAULT_LOG_LEVEL: &str = if cfg!(feature = "max_level_error") {
     "error"
@@ -154,6 +148,35 @@ where
         .transpose()
 }
 
+fn deserialize_register<'de, D>(deserializer: D) -> Result<Option<Register>, D::Error>
+where
+    D: serde::de::Deserializer<'de>,
+{
+    let r = <&'de str>::deserialize(deserializer)?;
+
+    if r.len() > 1 {
+        return Err(D::Error::custom("expected a single character to specify a register"));
+    }
+
+    let r = match r.chars().next() {
+        Some(c @ 'a'..='z') => Register::Named(c),
+        Some('_') => Register::Blackhole,
+        Some('*') => Register::SelectionPrimary,
+        Some('+') => Register::SelectionClipboard,
+        Some('"') => Register::Unnamed,
+        Some(c) => {
+            return Err(D::Error::custom(format!(
+                "expected one of a-z, \", _, *, or + for the register, not {c:?}"
+            )));
+        },
+        None => {
+            return Err(D::Error::custom("expected a single character to specify a register"));
+        },
+    };
+
+    Ok(Some(r))
+}
+
 const VERSION: &str = match option_env!("VERGEN_GIT_SHA") {
     None => env!("CARGO_PKG_VERSION"),
     Some(_) => concat!(env!("CARGO_PKG_VERSION"), " (", env!("VERGEN_GIT_SHA"), ")"),
@@ -171,6 +194,9 @@ pub struct Iamb {
 
     #[clap(short = 'C', long, value_parser)]
     pub config_directory: Option<PathBuf>,
+
+    /// `matrix:` uri or `https://matrix.to` link to open
+    pub uri: Option<String>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -546,6 +572,9 @@ impl Visitor<'_> for NotifyViaVisitor {
 pub struct Encryption {
     indicator: Option<EncryptionIndicator>,
     indicator_location: Option<EncryptionIndicatorLocation>,
+    icon_encrypted: Option<String>,
+    icon_unencrypted: Option<String>,
+    icon_unknown: Option<String>,
 }
 
 impl Encryption {
@@ -553,6 +582,9 @@ impl Encryption {
         Encryption {
             indicator: profile.indicator.or(global.indicator),
             indicator_location: profile.indicator_location.or(global.indicator_location),
+            icon_encrypted: profile.icon_encrypted.or(global.icon_encrypted),
+            icon_unencrypted: profile.icon_unencrypted.or(global.icon_unencrypted),
+            icon_unknown: profile.icon_unknown.or(global.icon_unknown),
         }
     }
 
@@ -560,6 +592,9 @@ impl Encryption {
         EncryptionValues {
             indicator: self.indicator.unwrap_or_default(),
             indicator_location: self.indicator_location.unwrap_or(DEFAULT_ENC_INDICATOR_LOC),
+            icon_encrypted: self.icon_encrypted.map(Cow::Owned).unwrap_or(DEFAULT_ICON_ENC),
+            icon_unencrypted: self.icon_unencrypted.map(Cow::Owned).unwrap_or(DEFAULT_ICON_UNENC),
+            icon_unknown: self.icon_unknown.map(Cow::Owned).unwrap_or(DEFAULT_ICON_UNKNOWN),
         }
     }
 }
@@ -568,6 +603,9 @@ impl Encryption {
 pub struct EncryptionValues {
     pub indicator: EncryptionIndicator,
     pub indicator_location: EncryptionIndicatorLocation,
+    pub icon_encrypted: Cow<'static, str>,
+    pub icon_unencrypted: Cow<'static, str>,
+    pub icon_unknown: Cow<'static, str>,
 }
 
 impl EncryptionValues {
@@ -591,28 +629,20 @@ impl EncryptionValues {
                 EncryptionIndicator::Enabled | EncryptionIndicator::OnlyEncrypted,
                 EncryptionState::Encrypted,
             ) => {
-                // Prompt must stay ASCII: WT draws U+1F512 two cells wide while
-                // unicode-width often counts 1, which leaves ghost glyphs while typing.
-                if location.contains(EncryptionIndicatorLocation::PROMPT) {
-                    Span::styled("> ", Style::new().fg(Color::LightGreen))
-                } else {
-                    Span::styled("\u{1F512}\u{FE0E} ", Style::new().fg(Color::LightGreen))
-                }
+                // Green encrypted icon:
+                Span::styled(self.icon_encrypted.clone(), Style::new().fg(Color::LightGreen))
             },
             (
                 EncryptionIndicator::Enabled | EncryptionIndicator::OnlyUnencrypted,
                 EncryptionState::NotEncrypted,
             ) => {
-                if location.contains(EncryptionIndicatorLocation::PROMPT) {
-                    Span::styled("> ", Style::new().fg(Color::Red))
-                } else {
-                    Span::styled("\u{1F513}\u{FE0E} ", Style::new().fg(Color::Red))
-                }
+                // Red unencrypted icon:
+                Span::styled(self.icon_unencrypted.clone(), Style::new().fg(Color::Red))
             },
 
             (_, EncryptionState::Unknown) => {
-                // Yellow question mark:
-                Span::styled("? ", Style::new().fg(Color::Yellow))
+                // Yellow unknown icon:
+                Span::styled(self.icon_unknown.clone(), Style::new().fg(Color::Yellow))
             },
         };
 
@@ -704,7 +734,6 @@ pub struct Notifications {
 #[derive(Clone)]
 pub struct ImagePreviewValues {
     pub enabled: bool,
-    pub lazy_load: bool,
     pub size: Size,
     pub protocol: ImagePreviewProtocolValues,
 }
@@ -712,7 +741,6 @@ pub struct ImagePreviewValues {
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct ImagePreview {
     pub enabled: Option<bool>,
-    pub lazy_load: Option<bool>,
     pub size: Option<Size>,
     pub protocol: Option<ImagePreviewProtocolValues>,
 }
@@ -721,7 +749,6 @@ impl ImagePreview {
     pub fn values(self) -> ImagePreviewValues {
         ImagePreviewValues {
             enabled: self.enabled.unwrap_or(true),
-            lazy_load: self.lazy_load.unwrap_or(true),
             size: self.size.unwrap_or(Size { width: 66, height: 10 }),
             protocol: self.protocol.unwrap_or_default(),
         }
@@ -872,7 +899,9 @@ pub struct TunableValues {
     pub users: UserOverrides,
     pub username_display: UserDisplayStyle,
     pub message_user_color: bool,
+    pub default_register: Option<Register>,
     pub default_room: Option<String>,
+    pub default_via: Vec<OwnedServerName>,
     pub open_command: Option<Vec<String>>,
     pub mouse: Mouse,
     pub notifications: Notifications,
@@ -929,7 +958,10 @@ pub struct Tunables {
     pub typing_notice_display: Option<bool>,
     pub username_display: Option<UserDisplayStyle>,
     pub message_user_color: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_register")]
+    pub default_register: Option<Register>,
     pub default_room: Option<String>,
+    pub default_via: Option<Vec<OwnedServerName>>,
     pub open_command: Option<Vec<String>>,
     pub mouse: Option<Mouse>,
     pub notifications: Option<Notifications>,
@@ -979,7 +1011,9 @@ impl Tunables {
             typing_notice_display: self.typing_notice_display.or(other.typing_notice_display),
             username_display: self.username_display.or(other.username_display),
             message_user_color: self.message_user_color.or(other.message_user_color),
+            default_register: self.default_register.or(other.default_register),
             default_room: self.default_room.or(other.default_room),
+            default_via: self.default_via.or(other.default_via),
             open_command: self.open_command.or(other.open_command),
             mouse: self.mouse.or(other.mouse),
             notifications: self.notifications.or(other.notifications),
@@ -1023,7 +1057,9 @@ impl Tunables {
             typing_notice_display: self.typing_notice_display.unwrap_or(true),
             username_display: self.username_display.unwrap_or_default(),
             message_user_color: self.message_user_color.unwrap_or(false),
+            default_register: self.default_register,
             default_room: self.default_room,
+            default_via: self.default_via.unwrap_or_else(|| vec![DEFAULT_VIA_SERVER.clone()]),
             open_command: self.open_command,
             mouse: self.mouse.unwrap_or_default(),
             notifications: self.notifications.unwrap_or_default(),
@@ -1046,11 +1082,12 @@ impl Tunables {
 #[serde(rename_all = "kebab-case")]
 #[repr(u8)]
 pub enum CursorShape {
-    #[default]
     Default,
     Block,
     Line,
     Underline,
+    #[default]
+    Auto,
 }
 
 impl From<CursorShape> for modalkit::crossterm::cursor::SetCursorStyle {
@@ -1060,6 +1097,9 @@ impl From<CursorShape> for modalkit::crossterm::cursor::SetCursorStyle {
             CursorShape::Block => Self::SteadyBlock,
             CursorShape::Line => Self::SteadyBar,
             CursorShape::Underline => Self::SteadyUnderScore,
+
+            // use steady block at startup and switch to the correct value on first render
+            CursorShape::Auto => Self::SteadyBlock,
         }
     }
 }
@@ -1247,12 +1287,18 @@ pub struct ApplicationSettings {
     pub session_json_old: PathBuf,
     pub sled_dir: PathBuf,
     pub sqlite_dir: PathBuf,
+    pub sqlite_cache_dir: PathBuf,
     pub profile_name: String,
     pub profile: ProfileConfig,
     pub tunables: TunableValues,
     pub dirs: DirectoryValues,
     pub layout: Layout,
     pub macros: Macros,
+
+    /// Whether to use the Kitty keyboard protocol. Resolved by
+    /// [`ApplicationSettings::probe_enhanced_keys`] once the TUI starts, since
+    /// it may require querying the terminal.
+    pub enable_enhanced_keys: bool,
 }
 
 impl ApplicationSettings {
@@ -1380,21 +1426,45 @@ impl ApplicationSettings {
         let mut layout_json = cache_dir.clone();
         layout_json.push("layout.json");
 
+        let mut sqlite_cache_dir = cache_dir;
+        sqlite_cache_dir.push("sqlite");
+
         let settings = ApplicationSettings {
             sled_dir,
             layout_json,
             session_json,
             session_json_old,
             sqlite_dir,
+            sqlite_cache_dir,
             profile_name,
             profile,
             tunables,
             dirs,
             layout,
             macros,
+            enable_enhanced_keys: false,
         };
 
         Ok(settings)
+    }
+
+    /// Work out whether to use the Kitty keyboard protocol, asking the terminal
+    /// when the user has not configured it explicitly.
+    ///
+    /// This queries the terminal, so it must only be called once, before the
+    /// TUI starts reading input.
+    pub fn probe_enhanced_keys(&mut self) {
+        self.enable_enhanced_keys =
+            self.tunables.terminal.enable_extended_keys.unwrap_or_else(|| {
+                crossterm::terminal::supports_keyboard_enhancement()
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        err = %e,
+                        "Failed to determine whether the terminal supports keyboard enhancements"
+                    )
+                })
+                .unwrap_or_default()
+            });
     }
 
     pub fn read_session(&self, path: impl AsRef<Path>) -> Result<Session, IambError> {
@@ -1474,15 +1544,29 @@ impl ApplicationSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{TEST_USER1, TEST_USER5, mock_room, mock_settings};
-    use matrix_sdk::ruma::user_id;
+
     use std::convert::TryFrom;
+
+    use matrix_sdk::ruma::user_id;
+
+    use crate::tests::{TEST_USER1, TEST_USER5, mock_room, mock_settings};
+
+    #[test]
+    fn test_get_user_span_borrowed() {
+        // fix `StyleTreeNode::print` for `StyleTreeNode::UserId` if this breaks
+        let info = mock_room();
+        let settings = mock_settings();
+        let span = settings.get_user_span(&TEST_USER1, &info);
+
+        assert!(matches!(span.content, Cow::Borrowed(_)));
+    }
 
     #[test]
     fn test_user_char_uses_display_name() {
         let settings = mock_settings();
         let mut info = mock_room();
-        info.display_names.set(TEST_USER1.clone(), Some("Camille Aubry".into()));
+        info.display_names
+            .set(TEST_USER1.clone(), Some("Camille Aubry".into()), true);
 
         let span = settings.get_user_char_span(&TEST_USER1, &info);
 
@@ -1493,7 +1577,8 @@ mod tests {
     fn test_user_char_prefers_configured_name() {
         let settings = mock_settings();
         let mut info = mock_room();
-        info.display_names.set(TEST_USER5.clone(), Some("Camille Aubry".into()));
+        info.display_names
+            .set(TEST_USER5.clone(), Some("Camille Aubry".into()), true);
 
         let span = settings.get_user_char_span(&TEST_USER5, &info);
 
@@ -1740,6 +1825,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_tunables_default_register() {
+        let reg_a: Tunables = serde_json::from_str(r#"{"default_register": "a"}"#).unwrap();
+        assert_eq!(reg_a.default_register, Some(Register::Named('a')));
+
+        let reg_z: Tunables = serde_json::from_str(r#"{"default_register": "z"}"#).unwrap();
+        assert_eq!(reg_z.default_register, Some(Register::Named('z')));
+
+        let reg_blackhole: Tunables = serde_json::from_str(r#"{"default_register": "_"}"#).unwrap();
+        assert_eq!(reg_blackhole.default_register, Some(Register::Blackhole));
+
+        let res: Result<Tunables, _> = serde_json::from_str(r#"{"default_register": "A"}"#);
+        assert!(res.is_err());
+
+        let res: Result<Tunables, _> = serde_json::from_str(r#"{"default_register": "0"}"#);
+        assert!(res.is_err());
+    }
+
+    #[test]
     fn test_parse_layout() {
         let user = WindowPath::UserId(user_id!("@user:example.com").to_owned());
         let alias = WindowPath::AliasId(OwnedRoomAliasId::try_from("#room:example.com").unwrap());
@@ -1840,7 +1943,8 @@ mod tests {
 
     #[test]
     fn test_parse_cursor_shape() {
-        assert_eq!(CursorShape::Default, CursorShape::default());
+        assert_eq!(CursorShape::Auto, CursorShape::default());
+        assert_eq!(CursorShape::Auto, serde_json::from_str(r#""auto""#).unwrap());
         assert_eq!(CursorShape::Default, serde_json::from_str(r#""default""#).unwrap());
         assert_eq!(CursorShape::Block, serde_json::from_str(r#""block""#).unwrap());
         assert_eq!(CursorShape::Line, serde_json::from_str(r#""line""#).unwrap());
@@ -1875,10 +1979,12 @@ mod tests {
     fn test_encryption_indicator_enabled() {
         use EncryptionState::*;
 
-        let enc = EncryptionValues {
-            indicator: EncryptionIndicator::Enabled,
-            indicator_location: EncryptionIndicatorLocation::TITLE,
+        let enc = Encryption {
+            indicator: Some(EncryptionIndicator::Enabled),
+            indicator_location: Some(EncryptionIndicatorLocation::TITLE),
+            ..Default::default()
         };
+        let enc = enc.values();
 
         // Always shows in the title:
         assert!(enc.get_indicator(EncryptionIndicatorLocation::TITLE, Encrypted).is_some());
@@ -1901,10 +2007,12 @@ mod tests {
     fn test_encryption_indicator_disabled() {
         use EncryptionState::*;
 
-        let enc = EncryptionValues {
-            indicator: EncryptionIndicator::Disabled,
-            indicator_location: EncryptionIndicatorLocation::TITLE,
+        let enc = Encryption {
+            indicator: Some(EncryptionIndicator::Disabled),
+            indicator_location: Some(EncryptionIndicatorLocation::TITLE),
+            ..Default::default()
         };
+        let enc = enc.values();
 
         // Never shows in the title or the prompt:
         assert!(enc.get_indicator(EncryptionIndicatorLocation::TITLE, Encrypted).is_none());
@@ -1925,10 +2033,12 @@ mod tests {
     fn test_encryption_indicator_only_encrypted() {
         use EncryptionState::*;
 
-        let enc = EncryptionValues {
-            indicator: EncryptionIndicator::OnlyEncrypted,
-            indicator_location: EncryptionIndicatorLocation::PROMPT,
+        let enc = Encryption {
+            indicator: Some(EncryptionIndicator::OnlyEncrypted),
+            indicator_location: Some(EncryptionIndicatorLocation::PROMPT),
+            ..Default::default()
         };
+        let enc = enc.values();
 
         // Shows in the prompt when encrypted or unknown:
         assert!(enc.get_indicator(EncryptionIndicatorLocation::PROMPT, Encrypted).is_some());
@@ -1952,10 +2062,12 @@ mod tests {
     fn test_encryption_indicator_only_unencrypted() {
         use EncryptionState::*;
 
-        let enc = EncryptionValues {
-            indicator: EncryptionIndicator::OnlyUnencrypted,
-            indicator_location: EncryptionIndicatorLocation::all(),
+        let enc = Encryption {
+            indicator: Some(EncryptionIndicator::OnlyUnencrypted),
+            indicator_location: Some(EncryptionIndicatorLocation::all()),
+            ..Default::default()
         };
+        let enc = enc.values();
 
         // Shows in both the prompt and title when unencrypted or unknown:
         assert!(

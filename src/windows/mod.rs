@@ -6,85 +6,23 @@
 //! Additionally, some of the iamb commands delegate behaviour to the current UI element. For
 //! example, [sending messages][crate::base::SendAction] delegate to the [room window][RoomState],
 //! where we have the message bar and room ID easily accessible and resettable.
-use std::cmp::{Ord, Ordering};
-use std::fmt::{self, Display};
-use std::ops::Deref;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use matrix_sdk::{
-    RoomState as MatrixRoomState,
-    room::{Room as MatrixRoom, RoomMember},
-    ruma::{
-        OwnedRoomAliasId,
-        OwnedRoomId,
-        RoomAliasId,
-        RoomId,
-        events::room::member::MembershipState,
-        events::tag::{TagName, Tags},
-    },
-};
+use std::cmp::Ord;
+use std::fmt::{self};
 
-use ratatui::{
-    buffer::Buffer,
-    layout::{Alignment, Rect},
-    style::{Color, Modifier as StyleModifier, Style},
-    text::{Line, Span, Text},
-    widgets::StatefulWidget,
-};
-
-use modalkit::{
-    actions::{
-        Action,
-        Editable,
-        EditorAction,
-        Jumpable,
-        PromptAction,
-        Promptable,
-        Scrollable,
-        WindowAction,
-    },
-    editing::completion::CompletionList,
-    errors::{EditError, EditResult, UIError},
-    prelude::*,
-};
-
-use modalkit_ratatui::{
-    TermOffset,
-    TerminalCursor,
-    Window,
-    WindowOps,
-    list::{List, ListCursor, ListItem, ListState},
-};
-
-use crate::base::{
-    ChatStore,
-    IambBufferId,
-    IambError,
-    IambId,
-    IambInfo,
-    IambResult,
-    MessageAction,
-    ProgramAction,
-    ProgramContext,
-    ProgramStore,
-    RoomAction,
-    SendAction,
-    SortColumn,
-    SortFieldRoom,
-    SortFieldUser,
-    SortOrder,
-    SpaceAction,
-    UnreadInfo,
-};
-use crate::config::ListColorValues;
-use crate::windows::room::room_command;
-
-use self::room::RoomState;
-use self::verify::VerifyItem;
-use self::welcome::WelcomeState;
-use crate::message::MessageTimeStamp;
 use feruca::Collator;
+use matrix_sdk::room::RoomMember;
+use matrix_sdk::ruma::RoomAliasId;
+use matrix_sdk::ruma::events::room::member::MembershipState;
+use modalkit_ratatui::Window;
+use modalkit_ratatui::list::{List, ListCursor, ListItem, ListState};
+
+use crate::base::{SortColumn, SortFieldRoom, SortFieldUser, SortOrder, UnreadInfo};
+use crate::config::ListColorValues;
+use crate::prelude::*;
+use crate::windows::room::{RoomState, room_command};
+use crate::windows::verify::VerifyItem;
+use crate::windows::welcome::WelcomeState;
 
 pub mod room;
 pub mod verify;
@@ -987,15 +925,19 @@ impl Window<IambInfo> for IambWindow {
     }
 
     fn find(name: String, store: &mut ProgramStore) -> IambResult<Self> {
-        let ChatStore { names, worker, .. } = &mut store.application;
+        let ChatStore { names, worker, settings, .. } = &mut store.application;
 
         if let Some(room) = names.get_mut(&name) {
             let id = IambId::Room(room.clone(), None);
 
             IambWindow::open(id, store)
         } else {
-            let room_id = worker.join_room(name.clone())?;
-            names.insert(name, room_id.clone());
+            let via = settings.tunables.default_via.clone();
+            let room_id = worker.join_room(name.clone(), via)?;
+
+            if let Ok(alias) = OwnedRoomAliasId::from_str(&name) {
+                names.insert(alias, room_id.clone());
+            }
 
             let (room, name, tags) = store.application.worker.get_room(room_id)?;
             let room = RoomState::new(room, None, name, tags, store);
@@ -1038,7 +980,7 @@ impl GenericChatItem {
         info.tags.clone_from(&room_info.deref().1);
 
         if let Some(alias) = &alias {
-            store.application.names.insert(alias.to_string(), room_id.to_owned());
+            store.application.names.insert(alias.to_owned(), room_id.to_owned());
         }
 
         GenericChatItem { room_info, name, alias, is_dm, unread }
@@ -1161,7 +1103,7 @@ impl RoomItem {
         info.tags.clone_from(&room_info.deref().1);
 
         if let Some(alias) = &alias {
-            store.application.names.insert(alias.to_string(), room_id.to_owned());
+            store.application.names.insert(alias.to_owned(), room_id.to_owned());
         }
 
         RoomItem { room_info, name, alias, unread }
@@ -1386,7 +1328,7 @@ impl SpaceItem {
         let alias = room_info.0.canonical_alias();
 
         if let Some(alias) = &alias {
-            store.application.names.insert(alias.to_string(), room_id.to_owned());
+            store.application.names.insert(alias.to_owned(), room_id.to_owned());
         }
 
         SpaceItem { room_info, name, alias }
@@ -1611,6 +1553,7 @@ impl Promptable<ProgramContext, ProgramStore, IambInfo> for MemberItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, room_alias_id, server_name};
 
     #[derive(Debug, Eq, PartialEq)]

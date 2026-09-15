@@ -1,20 +1,12 @@
-use std::{collections::HashMap, sync::Arc};
-
-use matrix_sdk::{
-    Media,
-    media::{MediaFormat, MediaRequestParameters, UniqueKey},
-    ruma::events::room::MediaSource,
-};
-use ratatui::layout::Size;
+use matrix_sdk::Media;
+use matrix_sdk::media::{MediaFormat, MediaRequestParameters, UniqueKey};
+use ratatui_image::picker::Picker;
 use ratatui_image::sliced::SlicedProtocol;
-use ratatui_image::{FilterType, Resize, picker::Picker};
+use ratatui_image::{FilterType, Resize};
 use tokio::sync::Semaphore;
 
-use crate::{
-    base::{AsyncProgramStore, IambError},
-    config::{ApplicationSettings, ImagePreviewValues},
-    worker::Requester,
-};
+use crate::config::ImagePreviewValues;
+use crate::prelude::*;
 
 pub enum ImageStatus {
     Queued(Size),
@@ -93,7 +85,6 @@ impl PreviewManager {
         settings: &ApplicationSettings,
         source: &MediaSource,
         kind: PreviewKind,
-        worker: &Requester,
     ) {
         let key = (source.unique_key(), kind);
         if self.previews.contains_key(&key) {
@@ -102,10 +93,6 @@ impl PreviewManager {
 
         let size = kind.image_size(&settings.tunables.image_preview);
         self.previews.insert(key, ImageStatus::Queued(size));
-
-        if settings.tunables.image_preview.enabled && !settings.tunables.image_preview.lazy_load {
-            self.load(source, kind, worker);
-        }
     }
 }
 

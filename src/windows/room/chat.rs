@@ -1,106 +1,46 @@
 //! Window for Matrix rooms
-use std::borrow::Cow;
 use std::convert::TryInto;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use edit::Builder;
 use edit::edit_with_builder as external_edit;
+use matrix_sdk::RoomState as MatrixRoomState;
+use matrix_sdk::attachment::AttachmentConfig;
 use matrix_sdk::attachment::{AttachmentInfo, BaseImageInfo};
+use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
 use matrix_sdk::room::reply::{EnforceThread, Reply};
+use matrix_sdk::ruma::events::Mentions;
+use matrix_sdk::ruma::events::reaction::ReactionEventContent;
+use matrix_sdk::ruma::events::relation::Annotation;
+use matrix_sdk::ruma::events::room::message::{
+    AddMentions,
+    ForwardThread,
+    MessageFormat,
+    ReplyWithinThread,
+    TextMessageEventContent,
+};
+use matrix_sdk::send_queue::RoomSendQueueError;
+use modalkit::editing::history::{self, HistoryList};
 use modalkit::editing::store::RegisterError;
-use std::process::Command;
-use tokio;
-use url::Url;
+use modalkit::keybindings::dialog::{Dialog, MultiChoice, MultiChoiceItem};
+use modalkit_ratatui::PromptActions;
+use modalkit_ratatui::textbox::{TextBox, TextBoxState};
+use ratatui::prelude::Stylize;
+use regex::Regex;
 
-use matrix_sdk::{
-    RoomState,
-    attachment::AttachmentConfig,
-    media::{MediaFormat, MediaRequestParameters},
-    room::Room as MatrixRoom,
-    ruma::{
-        OwnedEventId,
-        OwnedRoomId,
-        RoomId,
-        events::reaction::ReactionEventContent,
-        events::relation::{Annotation, Replacement},
-        events::room::message::{
-            AddMentions,
-            ForwardThread,
-            MessageType,
-            OriginalRoomMessageEvent,
-            Relation,
-            ReplyWithinThread,
-        },
-    },
-    send_queue::RoomSendQueueError,
-};
-
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    prelude::Stylize,
-    text::{Line, Span},
-    widgets::{Paragraph, StatefulWidget, Widget},
-};
-
-use modalkit::keybindings::dialog::{Dialog, MultiChoice, MultiChoiceItem, PromptYesNo};
-
-use modalkit_ratatui::{
-    PromptActions,
-    TerminalCursor,
-    WindowOps,
-    textbox::{TextBox, TextBoxState},
-};
-
-use modalkit::actions::{
-    Action,
-    Editable,
-    EditorAction,
-    Jumpable,
-    PromptAction,
-    Promptable,
-    Scrollable,
-};
-use modalkit::editing::{
-    completion::CompletionList,
-    context::Resolve,
-    history::{self, HistoryList},
-    rope::EditRope,
-};
-use modalkit::errors::{EditError, EditResult, UIError};
-use modalkit::prelude::*;
-
-use crate::base::{
-    DownloadFlags,
-    EchoLocation,
-    IambAction,
-    IambBufferId,
-    IambError,
-    IambInfo,
-    IambResult,
-    MessageAction,
-    ProgramAction,
-    ProgramContext,
-    ProgramStore,
-    RoomFocus,
-    RoomInfo,
-    SendAction,
-};
-
-use crate::config::{ApplicationSettings, EncryptionIndicatorLocation};
+use crate::base::{DownloadFlags, EchoLocation};
+use crate::config::EncryptionIndicatorLocation;
 use crate::message::{
-    MessageEvent,
     MessageId,
-    MessageKey,
     TreeGenState,
     text_to_message,
     text_to_text_message_event_content,
 };
-use crate::worker::Requester;
-
-use super::scrollback::{Scrollback, ScrollbackState};
+use crate::prelude::*;
+use crate::util::SuspendedTty;
+use crate::windows::room::scrollback::{Scrollback, ScrollbackState};
 
 /// State needed for rendering [Chat].
 pub struct ChatState {
@@ -151,7 +91,7 @@ impl ChatState {
             return Err(IambError::NotJoined);
         };
 
-        if room.state() == RoomState::Joined {
+        if room.state() == MatrixRoomState::Joined {
             Ok(room)
         } else {
             Err(IambError::NotJoined)
@@ -214,15 +154,18 @@ impl ChatState {
                 Err(UIError::NeedConfirm(prompt))
             },
             MessageAction::Download(filename, flags) => {
+                if let MessageEvent::State(_) = &msg.event {
+                    let err = open_links(msg);
+                    return Err(err);
+                }
+
                 if let Some(msgtype) = msg.event.msgtype() {
                     let media = client.media();
-
                     let mut filename = match (filename, &settings.dirs.downloads) {
                         (Some(f), _) => PathBuf::from(f),
                         (None, Some(downloads)) => downloads.clone(),
                         (None, None) => return Err(IambError::NoDownloadDir.into()),
                     };
-
                     let (source, msg_filename) = match msgtype {
                         MessageType::Audio(c) => (c.source.clone(), c.filename()),
                         MessageType::File(c) => (c.source.clone(), c.filename()),
@@ -232,46 +175,13 @@ impl ChatState {
                             if !flags.contains(DownloadFlags::OPEN) {
                                 return Err(IambError::NoAttachment.into());
                             }
-
-                            let mut links = if let Some(html) = &msg.html {
-                                html.get_links()
-                            } else {
-                                vec![]
-                            };
-
-                            if links.is_empty() {
-                                links = linkify::LinkFinder::new()
-                                    .links(&msg.event.body())
-                                    .filter_map(|u| Url::parse(u.as_str()).ok())
-                                    .scan(TreeGenState { link_num: 0 }, |state, u| {
-                                        state.next_link_char().map(|c| (c, u))
-                                    })
-                                    .collect();
-                            }
-
-                            if links.is_empty() {
-                                return Err(IambError::NoAttachment.into());
-                            }
-
-                            let choices = links
-                                .into_iter()
-                                .map(|l| {
-                                    let url = l.1.to_string();
-                                    let act = IambAction::OpenLink(url.clone()).into();
-                                    MultiChoiceItem::new(l.0, url, vec![act])
-                                })
-                                .collect();
-                            let dialog = MultiChoice::new(choices);
-                            let err = UIError::NeedConfirm(Box::new(dialog));
-
+                            let err = open_links(msg);
                             return Err(err);
                         },
                     };
-
                     if filename.is_dir() {
                         filename.push(msg_filename.replace(std::path::MAIN_SEPARATOR_STR, "_"));
                     }
-
                     if filename.exists() && !flags.contains(DownloadFlags::FORCE) {
                         // Find an incrementally suffixed filename, e.g. image-2.jpg -> image-3.jpg
                         if let Some(stem) = filename.file_stem().and_then(OsStr::to_str) {
@@ -291,7 +201,6 @@ impl ChatState {
                             }
                         }
                     }
-
                     if !filename.exists() || flags.contains(DownloadFlags::FORCE) {
                         let req = MediaRequestParameters { source, format: MediaFormat::File };
 
@@ -310,7 +219,6 @@ impl ChatState {
 
                         return Err(err);
                     }
-
                     let info = if flags.contains(DownloadFlags::OPEN) {
                         let target = filename.clone().into_os_string();
                         match open_command(
@@ -333,7 +241,6 @@ impl ChatState {
                             filename.display()
                         ))
                     };
-
                     return Ok(info.into());
                 }
 
@@ -613,6 +520,14 @@ impl ChatState {
             .filter(|c| !c.is_blank())
             .map(|c| c.trim_end().to_string())
             .and_then(|c| text_to_text_message_event_content(c, settings.tunables.default_markup));
+
+        let mentions = if let Some(content) = &config.caption {
+            extract_mentions(content)
+        } else {
+            Mentions::new()
+        };
+        config.mentions = Some(mentions);
+
         config.reply = self.generate_reply_info(info, add_caption);
         config
     }
@@ -635,11 +550,15 @@ impl ChatState {
                 let msg = if let SendAction::SubmitFromEditor = act {
                     let suffix =
                         store.application.settings.tunables.external_edit_file_suffix.as_str();
+                    // Give the terminal back to the editor, and take it again
+                    // however we leave this block.
+                    let _tty = SuspendedTty::new(&store.application.settings);
                     let edited_msg =
                         external_edit(msg.trim_end().to_string(), Builder::new().suffix(suffix))?
                             .trim_end()
                             .to_string();
                     if edited_msg.is_empty() {
+                        self.tbox.reset();
                         return Ok(None);
                     }
                     edited_msg
@@ -649,7 +568,14 @@ impl ChatState {
                     msg.trim_end().to_string()
                 };
 
-                let mut msg = text_to_message(msg, tunables.default_markup);
+                let mut msg = text_to_message(msg.into(), tunables.default_markup);
+
+                let mentions = if let MessageType::Text(content) = &msg.msgtype {
+                    extract_mentions(content)
+                } else {
+                    Mentions::new()
+                };
+                msg = msg.add_mentions(mentions);
 
                 if let Some(key) = &self.editing {
                     let id = match &key.id {
@@ -689,20 +615,27 @@ impl ChatState {
                         },
                     };
 
-                    msg.relates_to = Some(Relation::Replacement(Replacement::new(
-                        id.to_owned(),
-                        msg.msgtype.clone().into(),
-                    )));
+                    let Some(edited_msg) = info.get_event(id) else {
+                        let msg = "edited message not found in store";
+                        return Err(UIError::Failure(msg.into()));
+                    };
+
+                    let MessageEvent::Original(edited_msg, _) = &edited_msg.event else {
+                        let msg = "you can only edit normal messages";
+                        return Err(UIError::Failure(msg.into()));
+                    };
+
+                    msg = msg.make_replacement(edited_msg.as_ref());
                 } else if let Some(thread_root) = self.scrollback.thread() {
                     if let Some(m) = self.get_reply_to(info) {
-                        msg = msg.make_for_thread(m, ReplyWithinThread::Yes, AddMentions::No);
+                        msg = msg.make_for_thread(m, ReplyWithinThread::Yes, AddMentions::Yes);
                     } else if let Some(m) = info.get_thread_last(thread_root) {
-                        msg = msg.make_for_thread(m, ReplyWithinThread::No, AddMentions::No);
+                        msg = msg.make_for_thread(m, ReplyWithinThread::No, AddMentions::Yes);
                     } else {
                         // Internal state is wonky?
                     }
                 } else if let Some(m) = self.get_reply_to(info) {
-                    msg = msg.make_reply_to(m, ForwardThread::Yes, AddMentions::No);
+                    msg = msg.make_reply_to(m, ForwardThread::Yes, AddMentions::Yes);
                 }
 
                 room.send_queue().send(msg.into()).await.map_err(IambError::from)?;
@@ -834,6 +767,37 @@ impl ChatState {
 
         store.application.worker.typing_notice(self.room_id.clone());
     }
+}
+
+fn open_links(msg: &Message) -> UIError<IambInfo> {
+    let mut links = if let Some(html) = &msg.html {
+        html.get_links()
+    } else {
+        vec![]
+    };
+
+    if links.is_empty() {
+        links = linkify::LinkFinder::new()
+            .links(&msg.event.body())
+            .filter_map(|u| Url::parse(u.as_str()).ok())
+            .scan(TreeGenState { link_num: 0 }, |state, u| state.next_link_char().map(|c| (c, u)))
+            .collect();
+    }
+
+    if links.is_empty() {
+        return IambError::NoAttachment.into();
+    }
+
+    let choices = links
+        .into_iter()
+        .map(|l| {
+            let url = l.1.to_string();
+            let act = IambAction::OpenLink(url.clone(), false).into();
+            MultiChoiceItem::new(l.0, url, vec![act])
+        })
+        .collect();
+    let dialog = MultiChoice::new(choices);
+    UIError::NeedConfirm(Box::new(dialog))
 }
 
 macro_rules! delegate {
@@ -1179,10 +1143,21 @@ impl StatefulWidget for Chat<'_> {
             .get_indicator(EncryptionIndicatorLocation::PROMPT, state.room().encryption_state());
         let input_prompt = settings.tunables.input_prompt.as_deref();
         let prompt = match (self.focused, encryption_indicator, input_prompt) {
-            (false, _, _) => Span::raw("  "),
-            (true, Some(i), _) => i,
-            (true, None, None) => Span::raw("> "),
-            (true, None, Some(s)) => Span::raw(s),
+            // User has both encryption indicator and custom prompt, combine them:
+            (false, Some(i), Some(p)) => Line::from(crate::util::space(i.width() + p.width())),
+            (true, Some(i), Some(p)) => Line::from(vec![i, Span::from(p)]),
+
+            // User has custom prompt, use that:
+            (false, None, Some(p)) => Line::from(crate::util::space(p.width())),
+            (true, None, Some(p)) => Line::from(p),
+
+            // User has encryption indicator, use that as prompt:
+            (false, Some(i), None) => Line::from(crate::util::space(i.width())),
+            (true, Some(i), None) => Line::from(i),
+
+            // User has no encryption indicator, no custom prompt, so show "> ":
+            (false, None, None) => Line::from(crate::util::space(2)),
+            (true, None, None) => Line::from("> "),
         };
 
         // Clear the bar first so a width-mismatched prompt cannot leave stale cells.
@@ -1219,6 +1194,31 @@ fn open_command(open_command: Option<&Vec<String>>, target: OsString) -> IambRes
         });
         return Ok(());
     }
+}
+
+/// Extract mentions from `https://matrix.to` html links
+fn extract_mentions(content: &TextMessageEventContent) -> Mentions {
+    let Some(formatted) = content.formatted.as_ref() else {
+        return Mentions::new();
+    };
+    if !matches!(formatted.format, MessageFormat::Html) {
+        return Mentions::new();
+    }
+    let html = formatted.body.as_str();
+
+    let re = Regex::new(r#"<a href="(https://matrix.to/#/@[^"]*:[^"]*)">"#).unwrap();
+
+    let user_ids = re.captures_iter(html).map(|capture| {
+        let link = capture.get(1).unwrap().as_str();
+        let uri = MatrixToUri::parse(link).unwrap();
+        let MatrixId::User(user_id) = uri.id() else {
+            // we only matched user links (starting with `@`)
+            unreachable!()
+        };
+        user_id.to_owned()
+    });
+
+    Mentions::with_user_ids(user_ids)
 }
 
 fn cmd(open_command: &Vec<String>) -> Option<Command> {

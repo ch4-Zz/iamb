@@ -139,6 +139,13 @@ Possible values are
 .Dq Sy markdown
 (the default) and
 .Dq Sy plaintext .
+.It default_register
+The default register to read and write to when one isn't specified.
+This defaults to the unnamed register,
+.Sy " ,
+but you can set it to something like
+.Sy +
+if you want to read and write from the system clipboard by default.
 .It Sy default_room
 The room to show by default instead of the
 .Sy :welcome
@@ -153,6 +160,10 @@ Possible values are
 .Dq Sy horizontal
 (the default) and
 .Dq Sy vertical .
+.It Sy default_via
+The servers to use to join a room if the homeserver cannot figure out how to join it.
+This defaults to
+.Sy ["matrix.org"] .
 .It Sy encryption
 Configuration subsection for specific settings related to room encryption.
 See
@@ -339,6 +350,18 @@ subsection allows controlling how encrypted rooms are presented.
 .Pp
 The available fields in this subsection are:
 .Bl -tag -width Ds
+.It Sy icon_encrypted
+Override the encrypted room icon used in the message bar prompt or title.
+Defaults to a green
+.Sy [E] .
+.It Sy icon_unencrypted
+Override the unencrypted room icon used in the message bar prompt or title.
+Defaults to a red
+.Sy [U] .
+.It Sy icon_unknown
+Override the unknown encryption status icon used in the message bar prompt or title.
+Defaults to a yellow
+.Sy [?] .
 .It Sy indicator
 Defines when an encryption status indicator is shown.
 Possible values are:
@@ -369,13 +392,6 @@ The available fields in this subsection are:
 .It Sy enabled
 Defaults to
 .Sy true .
-.It Sy lazy_load
-If
-.Sy true
-(the default), download and render image previews when viewing a message with an image.
-If
-.Sy false ,
-load previews as soon as a message with an image is received.
 .It Sy size
 An optional object with
 .Sy width
@@ -606,11 +622,21 @@ The available fields in this subsection are:
 Control the terminal cursor shape used by iamb.
 Possible values are:
 .Dq Sy default ,
+.Dq Sy auto ,
 .Dq Sy block ,
 .Dq Sy line , and
 .Dq Sy underline .
+The mode
+.Dq Sy auto
+switches between
+.Dq Sy block
+in normal mode,
+.Dq Sy line
+in insert mode, and
+.Dq Sy underline
+in replace mode.
 Defaults to
-.Dq Sy default .
+.Dq Sy auto .
 .It Sy enable_extended_keys
 Defines whether to explicitly enable or disable requesting extended keypresses from your terminal.
 By default, when unset,

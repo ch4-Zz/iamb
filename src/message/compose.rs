@@ -1,22 +1,34 @@
 //! Code for converting composed messages into content to send to the homeserver.
-use comrak::{markdown_to_html, options::Options};
-use nom::{
-    IResult,
-    Parser as _,
-    branch::alt,
-    bytes::complete::tag,
-    character::complete::space0,
-    combinator::value,
-};
+use std::sync::Arc;
 
-use matrix_sdk::ruma::events::room::message::{
-    EmoteMessageEventContent,
-    MessageType,
-    RoomMessageEventContent,
-    TextMessageEventContent,
-};
+use comrak::options::{BrokenLinkReference, Options};
+use comrak::{ResolvedReference, markdown_to_html};
+use matrix_sdk::ruma::events::room::message::{EmoteMessageEventContent, TextMessageEventContent};
+use nom::branch::alt;
+use nom::bytes::complete::tag;
+use nom::character::complete::space0;
+use nom::combinator::value;
+use nom::{IResult, Parser as _};
 
 use crate::config::MarkupFormat;
+use crate::prelude::*;
+
+fn broken_link_handler(link: BrokenLinkReference<'_>) -> Option<ResolvedReference> {
+    let uri = if let Ok(user_id) = OwnedUserId::from_str(link.normalized) {
+        user_id.matrix_to_uri()
+    } else if let Ok(room_id) = OwnedRoomAliasId::from_str(link.normalized) {
+        room_id.matrix_to_uri()
+    } else if let Ok(room_id) = OwnedRoomId::from_str(link.normalized) {
+        room_id.matrix_to_uri()
+    } else {
+        return None;
+    };
+
+    Some(ResolvedReference {
+        url: uri.to_string(),
+        title: link.normalized.to_string(),
+    })
+}
 
 #[derive(Clone, Debug, Default)]
 enum SlashCommand {
@@ -73,7 +85,7 @@ impl SlashCommand {
                 MessageType::Text(msg)
             },
             SlashCommand::Markdown => {
-                let msg = text_to_message_content(input.to_string());
+                let msg = text_to_message_content(input.into());
                 MessageType::Text(msg)
             },
             SlashCommand::Confetti => {
@@ -172,21 +184,26 @@ fn text_to_html(input: &str) -> Option<String> {
     options.extension.autolink = true;
     options.extension.shortcodes = true;
     options.extension.strikethrough = true;
+    options.parse.broken_link_callback = Some(Arc::new(broken_link_handler));
     options.render.hardbreaks = true;
     markdown_to_html(input, &options).into()
 }
 
-fn text_to_message_content(input: String) -> TextMessageEventContent {
-    if let Some(html) = text_to_html(input.as_str()) {
+fn text_to_message_content(input: Cow<'_, str>) -> TextMessageEventContent {
+    if let Some(html) = text_to_html(&input) {
         TextMessageEventContent::html(input, html)
     } else {
         TextMessageEventContent::plain(input)
     }
 }
 
-pub fn text_to_message(input: String, default_markup: MarkupFormat) -> RoomMessageEventContent {
-    let (rest, slash) = parse_slash_command(input.as_str())
+pub fn text_to_message(
+    input: Cow<'_, str>,
+    default_markup: MarkupFormat,
+) -> RoomMessageEventContent {
+    let (rest, slash) = parse_slash_command(&input)
         .unwrap_or_else(|_| (&input, SlashCommand::from(default_markup)));
+
     let msg = slash
         .to_message(rest)
         .unwrap_or_else(|_| MessageType::Text(text_to_message_content(input)));
@@ -199,19 +216,13 @@ pub fn text_to_text_message_event_content(
     input: String,
     default_markup: MarkupFormat,
 ) -> Option<TextMessageEventContent> {
-    let (body, cmd) = parse_slash_command(&input)
+    let (rest, slash) = parse_slash_command(&input)
         .unwrap_or_else(|_| (&input, SlashCommand::from(default_markup)));
 
-    let content = match cmd {
-        SlashCommand::Html => TextMessageEventContent::html(body, body),
-        SlashCommand::Plaintext => TextMessageEventContent::plain(body),
-        SlashCommand::Markdown => {
-            if let Some(html) = text_to_html(body) {
-                TextMessageEventContent::html(body, html)
-            } else {
-                TextMessageEventContent::plain(body)
-            }
-        },
+    let content = match slash {
+        SlashCommand::Html => TextMessageEventContent::html(rest, rest),
+        SlashCommand::Plaintext => TextMessageEventContent::plain(rest),
+        SlashCommand::Markdown => text_to_message_content(rest.into()),
         _ => return None,
     };
 
@@ -246,6 +257,63 @@ pub mod tests {
         assert_eq!(
             content.formatted.unwrap().body,
             "<p>See docs (they're at <a href=\"https://iamb.chat\">https://iamb.chat</a>)</p>\n"
+        );
+    }
+
+    #[test]
+    fn test_markdown_link_alias() {
+        let input = "[#room1:example.com]\n";
+        let content = text_to_message_content(input.into());
+        assert_eq!(content.body, input);
+        assert_eq!(
+            content.formatted.unwrap().body,
+            "<p><a href=\"https://matrix.to/#/%23room1:example.com\" title=\"#room1:example.com\">#room1:example.com</a></p>\n"
+        );
+
+        let input = "See [other room][#room1:example.com]\n";
+        let content = text_to_message_content(input.into());
+        assert_eq!(content.body, input);
+        assert_eq!(
+            content.formatted.unwrap().body,
+            "<p>See <a href=\"https://matrix.to/#/%23room1:example.com\" title=\"#room1:example.com\">other room</a></p>\n"
+        );
+    }
+
+    #[test]
+    fn test_markdown_link_room() {
+        let input = "[!room1:example.com]\n";
+        let content = text_to_message_content(input.into());
+        assert_eq!(content.body, input);
+        assert_eq!(
+            content.formatted.unwrap().body,
+            "<p><a href=\"https://matrix.to/#/!room1:example.com\" title=\"!room1:example.com\">!room1:example.com</a></p>\n"
+        );
+
+        let input = "See [other room][!room1:example.com]\n";
+        let content = text_to_message_content(input.into());
+        assert_eq!(content.body, input);
+        assert_eq!(
+            content.formatted.unwrap().body,
+            "<p>See <a href=\"https://matrix.to/#/!room1:example.com\" title=\"!room1:example.com\">other room</a></p>\n"
+        );
+    }
+
+    #[test]
+    fn test_markdown_link_user() {
+        let input = "[@user1:example.com]\n";
+        let content = text_to_message_content(input.into());
+        assert_eq!(content.body, input);
+        assert_eq!(
+            content.formatted.unwrap().body,
+            "<p><a href=\"https://matrix.to/#/@user1:example.com\" title=\"@user1:example.com\">@user1:example.com</a></p>\n"
+        );
+
+        let input = "Talk to [Jane][@user1:example.com]\n";
+        let content = text_to_message_content(input.into());
+        assert_eq!(content.body, input);
+        assert_eq!(
+            content.formatted.unwrap().body,
+            "<p>Talk to <a href=\"https://matrix.to/#/@user1:example.com\" title=\"@user1:example.com\">Jane</a></p>\n"
         );
     }
 

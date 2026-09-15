@@ -1,43 +1,11 @@
 //! Window for Matrix spaces
-use std::ops::{Deref, DerefMut};
-use std::str::FromStr;
-use std::time::{Duration, Instant};
 
 use matrix_sdk::ruma::OwnedSpaceChildOrder;
 use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::ruma::events::space::child::SpaceChildEventContent;
-use matrix_sdk::{
-    room::Room as MatrixRoom,
-    ruma::{OwnedRoomId, RoomId},
-};
+use modalkit_ratatui::list::{List, ListState};
 
-use modalkit::prelude::{EditInfo, InfoMessage};
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Color, Style},
-    text::{Line, Span, Text},
-    widgets::StatefulWidget,
-};
-
-use modalkit_ratatui::{
-    TermOffset,
-    TerminalCursor,
-    WindowOps,
-    list::{List, ListState},
-};
-
-use crate::base::{
-    IambBufferId,
-    IambError,
-    IambInfo,
-    IambResult,
-    ProgramContext,
-    ProgramStore,
-    RoomFocus,
-    SpaceAction,
-};
-
+use crate::prelude::*;
 use crate::windows::{RoomItem, RoomLikeItem, room_fields_cmp};
 
 const SPACE_HIERARCHY_DEBOUNCE: Duration = Duration::from_secs(5);
@@ -105,9 +73,26 @@ impl SpaceState {
                     return Err(IambError::InsufficientPermission.into());
                 }
 
-                let child_id = store.application.worker.join_room(child)?;
+                let (child_id, via) = match OwnedRoomId::try_from(child) {
+                    Ok(room_id) => {
+                        // assume the new child is reachable the same way as the parent
+                        let via = self.room.route().await.map_err(IambError::from)?;
 
-                let via = self.room.route().await.map_err(IambError::from)?;
+                        (room_id, via)
+                    },
+                    Err(alias) => {
+                        let resp = store
+                            .application
+                            .worker
+                            .client
+                            .resolve_room_alias(&alias)
+                            .await
+                            .map_err(IambError::from)?;
+
+                        (resp.room_id, resp.servers)
+                    },
+                };
+
                 let mut ev = SpaceChildEventContent::new(via);
                 ev.order = order
                     .as_deref()

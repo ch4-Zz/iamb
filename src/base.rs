@@ -1,112 +1,50 @@
 //! # Common types and utilities
 //!
 //! The types defined here get used throughout iamb.
-use std::borrow::Cow;
-use std::collections::hash_map::{Entry, IntoIter};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::convert::TryFrom;
-use std::fmt::{self, Display};
-use std::hash::Hash;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+
+use std::collections::hash_map::IntoIter;
+use std::collections::{BTreeSet, HashSet};
 
 use emojis::Emoji;
-
 use matrix_sdk::Client;
-use matrix_sdk::encryption::verification::VerificationRequest;
+use matrix_sdk::ruma::events::reaction::ReactionEvent;
+use matrix_sdk::ruma::events::relation::Replacement;
+use matrix_sdk::ruma::events::room::encrypted::RoomEncryptedEvent;
+use matrix_sdk::ruma::events::room::message::{
+    RoomMessageEvent,
+    RoomMessageEventContentWithoutRelation,
+};
+use matrix_sdk::ruma::events::room::redaction::{
+    OriginalSyncRoomRedactionEvent,
+    SyncRoomRedactionEvent,
+};
+use matrix_sdk::ruma::events::sticker::{StickerEvent, StickerEventContent};
+use matrix_sdk::ruma::events::{MessageLikeEvent, OriginalMessageLikeEvent};
+use matrix_sdk::ruma::presence::PresenceState;
 use matrix_sdk::ruma::room::{AllowRule, Restricted};
-use ratatui::{
-    buffer::Buffer,
-    layout::{Alignment, Rect},
-    text::{Line, Span},
-    widgets::{Paragraph, Widget},
+use matrix_sdk::ruma::{OwnedMxcUri, OwnedTransactionId, RoomVersionId};
+use modalkit::editing::application::{
+    ApplicationAction,
+    ApplicationContentId,
+    ApplicationError,
+    ApplicationInfo,
+    ApplicationStore,
+    ApplicationWindowId,
 };
-use serde::{
-    Deserialize,
-    Deserializer,
-    Serialize,
-    Serializer,
-    de::Error as SerdeError,
-    de::Visitor,
-};
+use modalkit::editing::completion::CompletionMap;
+use modalkit::editing::context::EditContext;
+use modalkit::editing::store::Store;
+use modalkit::env::vim::command::{CommandContext, VimCommand, VimCommandMachine};
+use modalkit::env::vim::keybindings::VimMachine;
+use modalkit::errors::UIResult;
+use modalkit::keybindings::SequenceStatus;
+use serde::de::Error as SerdeError;
+use serde::de::Visitor;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::sync::Mutex as AsyncMutex;
-use url::Url;
 
-use matrix_sdk::{
-    RoomState as MatrixRoomState,
-    room::Room as MatrixRoom,
-    ruma::{
-        EventId,
-        OwnedEventId,
-        OwnedMxcUri,
-        OwnedRoomAliasId,
-        OwnedRoomId,
-        OwnedRoomOrAliasId,
-        OwnedTransactionId,
-        OwnedUserId,
-        RoomId,
-        RoomVersionId,
-        UserId,
-        events::{
-            AnySyncStateEvent,
-            MessageLikeEvent,
-            OriginalMessageLikeEvent,
-            reaction::ReactionEvent,
-            receipt::ReceiptThread,
-            relation::{Replacement, Thread},
-            room::MediaSource,
-            room::encrypted::RoomEncryptedEvent,
-            room::message::{
-                MessageType,
-                OriginalRoomMessageEvent,
-                Relation,
-                RoomMessageEvent,
-                RoomMessageEventContent,
-                RoomMessageEventContentWithoutRelation,
-            },
-            room::redaction::{OriginalSyncRoomRedactionEvent, SyncRoomRedactionEvent},
-            sticker::{StickerEvent, StickerEventContent},
-            tag::{TagName, Tags},
-        },
-        presence::PresenceState,
-        profile::{ProfileFieldName, ProfileFieldValue},
-        room::JoinRule,
-    },
-};
-
-use modalkit::{
-    actions::Action,
-    editing::{
-        application::{
-            ApplicationAction,
-            ApplicationContentId,
-            ApplicationError,
-            ApplicationInfo,
-            ApplicationStore,
-            ApplicationWindowId,
-        },
-        completion::CompletionMap,
-        context::EditContext,
-        store::Store,
-    },
-    env::vim::{
-        command::{CommandContext, VimCommand, VimCommandMachine},
-        keybindings::VimMachine,
-    },
-    errors::{UIError, UIResult},
-    key::TerminalKey,
-    keybindings::SequenceStatus,
-    prelude::{CommandType, MoveDir1D, WordStyle},
-};
-
-use crate::preview::PreviewKind;
-use crate::{
-    config::ApplicationSettings,
-    message::{Message, MessageEvent, MessageKey, MessageTimeStamp, Messages},
-    notifications::NotificationHandle,
-    preview::PreviewManager,
-    worker::Requester,
-};
+use crate::notifications::NotificationHandle;
+use crate::prelude::*;
 
 /// The set of characters used in different Matrix IDs.
 pub const MATRIX_ID_WORD: WordStyle = WordStyle::CharSet(is_mxid_char);
@@ -199,8 +137,8 @@ pub enum MessageAction {
 pub enum SpaceAction {
     /// Add a room or update metadata.
     SetChild {
-        /// The room ID, alias, or a user whose DM room should be added to the space.
-        child: String,
+        /// The room that should be added to the space.
+        child: OwnedRoomOrAliasId,
         /// The order parameter to use when sorting children in the space.
         order: Option<String>,
         /// Whether the room is suggested.
@@ -628,7 +566,7 @@ pub enum KeysAction {
     Import(String, String),
 }
 
-/// An action that the main program loop should.
+/// An action that the main program loop should execute.
 ///
 /// See [the commands module][super::commands] for where these are usually created.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -645,8 +583,8 @@ pub enum IambAction {
     /// Perform an action on the current space.
     Space(SpaceAction),
 
-    /// Open a URL.
-    OpenLink(String),
+    /// Open a URL (and specify whether to join linked matrix rooms).
+    OpenLink(String, bool),
 
     /// Perform an action on the currently focused room.
     Room(RoomAction),
@@ -1039,12 +977,24 @@ impl UnreadInfo {
     }
 }
 
+/// The [`OwnedUserId`]s for users with the given displayname in [`DisplayNameStore`].
+#[derive(Default)]
+struct DisplayNameUsers {
+    /// Joined or invited users. Count towards username disambiguation.
+    active: HashSet<OwnedUserId>,
+
+    /// Left and knocking users. Are always disambiguated.
+    inactive: HashSet<OwnedUserId>,
+}
+
 /// Track the display names for users and render any needed disambiguation for
 /// those with overlapping names.
 #[derive(Default)]
 pub struct DisplayNameStore {
-    by_ids: HashMap<OwnedUserId, String>,
-    by_names: HashMap<String, HashSet<OwnedUserId>>,
+    /// The boolean is the same `is_active` field as the argument to [`Self::set`].
+    by_ids: CompletionMap<OwnedUserId, (Option<String>, bool)>,
+
+    by_names: CompletionMap<String, DisplayNameUsers>,
 }
 
 impl DisplayNameStore {
@@ -1053,74 +1003,104 @@ impl DisplayNameStore {
     /// Note that this *could* be done more elegantly using the Entry API, but
     /// is intentionally written in a way to avoid cloning conflicting display
     /// names.
-    fn set_by_name(&mut self, user_id: OwnedUserId, name: &str) {
+    fn set_by_name(&mut self, user_id: OwnedUserId, name: &str, is_active: bool) {
         if let Some(existing) = self.by_names.get_mut(name) {
-            existing.insert(user_id);
+            if is_active {
+                existing.active.insert(user_id);
+            } else {
+                existing.inactive.insert(user_id);
+            }
         } else {
-            self.by_names.insert(name.to_owned(), HashSet::from([user_id]));
+            let mut value = DisplayNameUsers::default();
+            if is_active {
+                value.active.insert(user_id);
+            } else {
+                value.inactive.insert(user_id);
+            }
+            self.by_names.insert(name.to_owned(), value);
         }
     }
 
-    /// Track a new user ID to displayname mapping, or unset any existing ones.
-    pub fn set(&mut self, user_id: OwnedUserId, name: Option<String>) {
+    /// Track a new user ID to displayname mapping, or unset any existing ones. `is_active` tracks,
+    /// whether the user is an active member (invited or joined) or not.
+    pub fn set(&mut self, user_id: OwnedUserId, name: Option<String>, is_active: bool) {
         if let Some(name) = name.as_deref() {
-            self.set_by_name(user_id.clone(), name);
+            self.set_by_name(user_id.clone(), name, is_active);
         }
 
-        let previous = match (self.by_ids.entry(user_id), name) {
-            // Nothing to do!
-            (Entry::Vacant(_), None) => None,
+        if self
+            .by_ids
+            .get(&user_id)
+            .is_some_and(|(n, a)| *n == name && *a == is_active)
+        {
+            // nothing to do
+            return;
+        }
 
-            // Setting initial display name for user:
-            (Entry::Vacant(v), Some(name)) => {
-                v.insert(name);
-                None
-            },
+        let previous = self.by_ids.insert(user_id.to_owned(), (name, is_active));
 
-            // Unsetting display name:
-            (Entry::Occupied(o), None) => Some(o.remove_entry()),
-
-            // Replacing existing name:
-            (Entry::Occupied(mut o), Some(name)) => {
-                if o.get() == &name {
-                    None
-                } else {
-                    Some((o.key().clone(), o.insert(name)))
-                }
-            },
-        };
-
-        let Some((user_id, previous)) = previous else {
+        let Some((Some(name), was_active)) = previous else {
+            // no previous entry in `self.by_names` to remove
             return;
         };
 
-        let Some(users) = self.by_names.get_mut(&previous) else {
+        let Some(users) = self.by_names.get_mut(&name) else {
             return;
         };
 
-        users.remove(&user_id);
+        if was_active {
+            users.active.remove(&user_id);
+        } else {
+            users.inactive.remove(&user_id);
+        }
 
-        if users.is_empty() {
-            self.by_names.remove(&previous);
+        if users.active.is_empty() && users.inactive.is_empty() {
+            self.by_names.remove(&name);
         }
     }
 
     pub fn get<'a>(&'a self, user_id: &UserId) -> Option<Cow<'a, str>> {
-        let displayname = self.by_ids.get(user_id)?;
+        let (displayname, is_active) = self.by_ids.get(user_id)?;
+        let displayname = displayname.as_ref()?;
         let users = self.by_names.get(displayname)?;
 
-        if !users.contains(user_id) {
+        if !users.active.contains(user_id) && !users.inactive.contains(user_id) {
             // Internal consistency error? Assume no display name:
             return None;
         }
 
-        if users.len() == 1 {
+        // Inactive members are always assumed to be ambiguous.
+        if *is_active && users.active.len() == 1 {
             // Unambiguous!
             return Some(Cow::Borrowed(displayname.as_str()));
         }
 
         // Ambiguous username, so include unique user ID:
         Some(Cow::Owned(format!("{displayname} ({user_id})")))
+    }
+
+    pub fn complete_mention(&self, prefix: &str) -> Vec<String> {
+        // spec says to mention with display name in anchor text
+        let mut users: BTreeSet<_> = self
+            .by_names
+            .complete(prefix.strip_prefix('@').unwrap_or(prefix))
+            .into_iter()
+            .flat_map(|name| {
+                let users = self.by_names.get(&name).unwrap();
+                users.active.iter().map(move |id| format!("[{name}][{}]", id))
+            })
+            .collect();
+
+        users.extend(self.by_ids.complete(prefix).into_iter().map(|id| {
+            let name = self
+                .by_ids
+                .get(&id)
+                .and_then(|(name, _)| name.as_deref())
+                .unwrap_or(id.as_str());
+            format!("[{}][{}]", name, id)
+        }));
+
+        users.into_iter().collect()
     }
 }
 
@@ -1384,7 +1364,6 @@ impl RoomInfo {
         sticker: StickerEvent,
         settings: &ApplicationSettings,
         previews: &mut PreviewManager,
-        worker: &Requester,
     ) {
         let event_id = sticker.event_id().to_owned();
         let key = MessageKey {
@@ -1411,7 +1390,7 @@ impl RoomInfo {
             settings.tunables.image_preview.enabled
         {
             let source = source.clone().into();
-            previews.register_preview(settings, &source, PreviewKind::Message, worker);
+            previews.register_preview(settings, &source, PreviewKind::Message);
         }
 
         let loc = EventLocation::Message(thread_root.clone(), key.clone());
@@ -1427,7 +1406,6 @@ impl RoomInfo {
         react: ReactionEvent,
         settings: &ApplicationSettings,
         previews: &mut PreviewManager,
-        worker: &Requester,
     ) {
         let MessageLikeEvent::Original(ref orig_react) = react else {
             return;
@@ -1442,7 +1420,7 @@ impl RoomInfo {
         if settings.tunables.image_preview.enabled &&
             let Some(source) = source.as_ref()
         {
-            previews.register_preview(settings, source, PreviewKind::Reaction, worker);
+            previews.register_preview(settings, source, PreviewKind::Reaction);
         }
 
         self.insert_reaction(react, source);
@@ -1587,7 +1565,6 @@ impl RoomInfo {
         ev: RoomMessageEvent,
         settings: &ApplicationSettings,
         previews: &mut PreviewManager,
-        worker: &Requester,
     ) {
         if let MessageLikeEvent::Original(OriginalMessageLikeEvent {
             content: RoomMessageEventContent { msgtype: MessageType::Image(c), .. },
@@ -1595,7 +1572,7 @@ impl RoomInfo {
         }) = &ev &&
             settings.tunables.image_preview.enabled
         {
-            previews.register_preview(settings, &c.source, PreviewKind::Message, worker)
+            previews.register_preview(settings, &c.source, PreviewKind::Message)
         }
 
         self.insert(ev);
@@ -1892,7 +1869,7 @@ pub struct ChatStore {
     pub rooms: CompletionMap<OwnedRoomId, RoomInfo>,
 
     /// Map of room names.
-    pub names: CompletionMap<String, OwnedRoomId>,
+    pub names: CompletionMap<OwnedRoomAliasId, OwnedRoomId>,
 
     /// Presence information for other users.
     pub presences: CompletionMap<OwnedUserId, PresenceState>,
@@ -2307,19 +2284,19 @@ impl ApplicationInfo for IambInfo {
 
 #[cfg(test)]
 pub mod tests {
+    use super::*;
+
     use std::iter::FromIterator as _;
 
-    use super::*;
-    use crate::config::user_style_from_color;
-    use crate::tests::*;
-    use matrix_sdk::ruma::{
-        MilliSecondsSinceUnixEpoch,
-        events::{reaction::ReactionEventContent, relation::Annotation},
-        owned_event_id,
-    };
+    use matrix_sdk::ruma::events::reaction::ReactionEventContent;
+    use matrix_sdk::ruma::events::relation::Annotation;
+    use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, owned_event_id};
     use pretty_assertions::assert_eq;
     use ratatui::style::Color;
     use serde_json::{Map, Value};
+
+    use crate::config::user_style_from_color;
+    use crate::tests::*;
 
     fn create_reaction_event(
         content: &ReactionEventContent,
@@ -2476,11 +2453,11 @@ pub mod tests {
     fn test_ambiguous_displaynames() {
         let mut store = DisplayNameStore::default();
 
-        store.set(TEST_USER1.clone(), Some("John".into()));
-        store.set(TEST_USER2.clone(), Some("John".into()));
-        store.set(TEST_USER3.clone(), Some("Jane".into()));
-        store.set(TEST_USER4.clone(), Some("Alice".into()));
-        store.set(TEST_USER5.clone(), Some("Bob".into()));
+        store.set(TEST_USER1.clone(), Some("John".into()), true);
+        store.set(TEST_USER2.clone(), Some("John".into()), true);
+        store.set(TEST_USER3.clone(), Some("Jane".into()), true);
+        store.set(TEST_USER4.clone(), Some("Alice".into()), true);
+        store.set(TEST_USER5.clone(), Some("Bob".into()), true);
 
         // TEST_USER1 and TEST_USER2 are both ambiguous, while the other are unambiguous:
         assert_eq!(store.get(&TEST_USER1).unwrap().as_ref(), "John (@user1:example.com)");
@@ -2490,7 +2467,7 @@ pub mod tests {
         assert_eq!(store.get(&TEST_USER5).unwrap().as_ref(), "Bob");
 
         // TEST_USER1 becomes unambiguous when TEST_USER2 changes:
-        store.set(TEST_USER2.clone(), Some("Eve".into()));
+        store.set(TEST_USER2.clone(), Some("Eve".into()), true);
         assert_eq!(store.get(&TEST_USER1).unwrap().as_ref(), "John");
         assert_eq!(store.get(&TEST_USER2).unwrap().as_ref(), "Eve");
         assert_eq!(store.get(&TEST_USER3).unwrap().as_ref(), "Jane");
@@ -2498,7 +2475,7 @@ pub mod tests {
         assert_eq!(store.get(&TEST_USER5).unwrap().as_ref(), "Bob");
 
         // TEST_USER5 becomes ambiguous when TEST_USER2 once again changes their name to match:
-        store.set(TEST_USER2.clone(), Some("Bob".into()));
+        store.set(TEST_USER2.clone(), Some("Bob".into()), true);
         assert_eq!(store.get(&TEST_USER1).unwrap().as_ref(), "John");
         assert_eq!(store.get(&TEST_USER2).unwrap().as_ref(), "Bob (@user2:example.com)");
         assert_eq!(store.get(&TEST_USER3).unwrap().as_ref(), "Jane");
@@ -2506,25 +2483,26 @@ pub mod tests {
         assert_eq!(store.get(&TEST_USER5).unwrap().as_ref(), "Bob (@user5:example.com)");
 
         // Now "Everyone is John":
-        store.set(TEST_USER2.clone(), Some("John".into()));
-        store.set(TEST_USER3.clone(), Some("John".into()));
-        store.set(TEST_USER4.clone(), Some("John".into()));
-        store.set(TEST_USER5.clone(), Some("John".into()));
+        store.set(TEST_USER2.clone(), Some("John".into()), true);
+        store.set(TEST_USER3.clone(), Some("John".into()), true);
+        store.set(TEST_USER4.clone(), Some("John".into()), true);
+        store.set(TEST_USER5.clone(), Some("John".into()), true);
         assert_eq!(store.get(&TEST_USER1).unwrap().as_ref(), "John (@user1:example.com)");
         assert_eq!(store.get(&TEST_USER2).unwrap().as_ref(), "John (@user2:example.com)");
         assert_eq!(store.get(&TEST_USER3).unwrap().as_ref(), "John (@user3:example.com)");
         assert_eq!(store.get(&TEST_USER4).unwrap().as_ref(), "John (@user4:example.com)");
         assert_eq!(store.get(&TEST_USER5).unwrap().as_ref(), "John (@user5:example.com)");
 
-        // 2-5 unset their displayname:
-        store.set(TEST_USER2.clone(), None);
-        store.set(TEST_USER3.clone(), None);
-        store.set(TEST_USER4.clone(), None);
-        store.set(TEST_USER5.clone(), None);
+        // 2-4 unset their displayname:
+        store.set(TEST_USER2.clone(), None, true);
+        store.set(TEST_USER3.clone(), None, true);
+        store.set(TEST_USER4.clone(), None, true);
+        // and 5 leaves
+        store.set(TEST_USER5.clone(), Some("John".into()), false);
         assert_eq!(store.get(&TEST_USER1).unwrap().as_ref(), "John");
         assert_eq!(store.get(&TEST_USER2), None);
         assert_eq!(store.get(&TEST_USER3), None);
         assert_eq!(store.get(&TEST_USER4), None);
-        assert_eq!(store.get(&TEST_USER5), None);
+        assert_eq!(store.get(&TEST_USER5).unwrap().as_ref(), "John (@user5:example.com)");
     }
 }
