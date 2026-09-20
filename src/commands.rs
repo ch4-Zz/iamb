@@ -52,8 +52,10 @@ fn tag_name(name: String) -> Result<TagName, CommandError> {
 /// Take the rest of the command line as one filesystem path.
 ///
 /// `CommandArgument::strings` treats `\` as a Vim escape, so Windows paths like
-/// `C:\Users\foo.png` fail at `\U`. Use the raw argument, strip matching quotes,
-/// and map `\` to `/` (accepted by `std::path` on Windows).
+/// `C:\Users\foo.png` fail at `\U`. Completions insert the same escapes for
+/// spaces (`\ `) on Unix. Use the raw argument, strip matching quotes, unescape
+/// known Vim sequences (leave unknown `\X` intact), and map remaining `\` to `/`
+/// on drive-letter paths (accepted by `std::path` on Windows).
 fn command_fs_path(arg: &str) -> Result<String, CommandError> {
     let raw = arg.trim();
     if raw.is_empty() {
@@ -76,7 +78,47 @@ fn command_fs_path(arg: &str) -> Result<String, CommandError> {
         return Err(CommandError::InvalidArgument);
     }
 
-    Ok(unquoted.replace('\\', "/"))
+    let unescaped = unescape_fs_path(unquoted);
+    if looks_like_windows_path(&unescaped) {
+        Ok(unescaped.replace('\\', "/"))
+    } else {
+        Ok(unescaped)
+    }
+}
+
+/// Unescape Vim path sequences used by tab completion (`\ `, `\\`, `\#`, …).
+/// Unknown pairs like `\U` in `C:\Users` are kept so Windows paths still parse.
+fn unescape_fs_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+
+        match chars.peek().copied() {
+            Some(' ' | '#' | '%' | '|' | '"') => {
+                out.push(chars.next().unwrap());
+            },
+            Some('\\') => {
+                out.push('\\');
+                chars.next();
+            },
+            Some(_) | None => out.push('\\'),
+        }
+    }
+
+    out
+}
+
+fn looks_like_windows_path(s: &str) -> bool {
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(drive), Some(':')) if drive.is_ascii_alphabetic() => true,
+        _ => s.starts_with("\\\\") || s.starts_with("//"),
+    }
 }
 
 fn iamb_invite(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
@@ -1781,6 +1823,15 @@ mod tests {
         let act = IambAction::from(SendAction::Upload("C:/already/forward.png".into(), None));
         assert_eq!(res, vec![(act.into(), ctx.clone())]);
 
+        let res = cmds
+            .input_cmd(r":upload Capture\ d’écran\ 2026-09-20\ à\ 16.14.34.png", ctx.clone())
+            .unwrap();
+        let act = IambAction::from(SendAction::Upload(
+            "Capture d’écran 2026-09-20 à 16.14.34.png".into(),
+            None,
+        ));
+        assert_eq!(res, vec![(act.into(), ctx.clone())]);
+
         let res = cmds.input_cmd(":upload", ctx.clone());
         assert_eq!(res, Err(CommandError::InvalidArgument));
     }
@@ -1796,6 +1847,26 @@ mod tests {
             "C:/Users/My Pictures/foo.png"
         );
         assert_eq!(command_fs_path("").unwrap_err(), CommandError::InvalidArgument);
+
+        // Tab completion inserts Vim `\ ` escapes (macOS/Linux screenshots, etc.).
+        assert_eq!(
+            command_fs_path(r"Capture\ d’écran\ 2026-09-20\ à\ 16.14.34.png").unwrap(),
+            "Capture d’écran 2026-09-20 à 16.14.34.png"
+        );
+        assert_eq!(
+            command_fs_path(r#""Capture d’écran 2026-09-20 à 16.14.34.png""#).unwrap(),
+            "Capture d’écran 2026-09-20 à 16.14.34.png"
+        );
+        assert_eq!(
+            command_fs_path("/Users/chazz/Desktop/foo.png").unwrap(),
+            "/Users/chazz/Desktop/foo.png"
+        );
+
+        // Windows completions double `\` and escape spaces.
+        assert_eq!(
+            command_fs_path(r"C:\\Users\\My\ Pictures\\foo.png").unwrap(),
+            "C:/Users/My Pictures/foo.png"
+        );
     }
 
     #[test]
