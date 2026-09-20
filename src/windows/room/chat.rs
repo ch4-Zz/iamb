@@ -12,6 +12,7 @@ use matrix_sdk::attachment::{AttachmentInfo, BaseImageInfo};
 use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
 use matrix_sdk::room::reply::{EnforceThread, Reply};
 use matrix_sdk::ruma::events::Mentions;
+use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::ruma::events::reaction::ReactionEventContent;
 use matrix_sdk::ruma::events::relation::Annotation;
 use matrix_sdk::ruma::events::room::message::{
@@ -21,6 +22,7 @@ use matrix_sdk::ruma::events::room::message::{
     ReplyWithinThread,
     TextMessageEventContent,
 };
+use matrix_sdk::ruma::events::room::pinned_events::RoomPinnedEventsEventContent;
 use matrix_sdk::send_queue::RoomSendQueueError;
 use modalkit::editing::history::{self, HistoryList};
 use modalkit::editing::store::RegisterError;
@@ -30,7 +32,7 @@ use modalkit_ratatui::textbox::{TextBox, TextBoxState};
 use ratatui::prelude::Stylize;
 use regex::Regex;
 
-use crate::base::{DownloadFlags, EchoLocation};
+use crate::base::{DownloadFlags, EchoLocation, RoomFetchStatus};
 use crate::config::EncryptionIndicatorLocation;
 use crate::message::{
     MessageId,
@@ -41,6 +43,11 @@ use crate::message::{
 use crate::prelude::*;
 use crate::util::SuspendedTty;
 use crate::windows::room::scrollback::{Scrollback, ScrollbackState};
+
+/// How long to wait for a message to load before giving up on jumping to it.
+///
+/// History loads one page roughly every two seconds, for up to `MESSAGE_NEED_TTL` pages.
+const PENDING_JUMP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// State needed for rendering [Chat].
 pub struct ChatState {
@@ -56,6 +63,9 @@ pub struct ChatState {
 
     reply_to: Option<MessageKey>,
     editing: Option<MessageKey>,
+
+    /// A message to jump to once it has been loaded, and when the jump was requested.
+    pending_jump: Option<(OwnedEventId, Instant)>,
 }
 
 impl ChatState {
@@ -79,6 +89,7 @@ impl ChatState {
 
             reply_to: None,
             editing: None,
+            pending_jump: None,
         }
     }
 
@@ -122,6 +133,77 @@ impl ChatState {
         }
     }
 
+    /// Where to put the cursor for a loaded message.
+    ///
+    /// A thread reply can't be shown in the main timeline, so that lands on its thread root.
+    fn jump_target(&self, info: &RoomInfo, event_id: &EventId) -> Option<MessageKey> {
+        let (thread, key) = info.get_message_location(event_id)?;
+
+        match thread {
+            Some(root) if self.thread().is_none() => info.get_message_key(root).cloned(),
+            _ => Some(key.clone()),
+        }
+    }
+
+    fn jump_to_message(
+        &mut self,
+        event_id: OwnedEventId,
+        store: &mut ProgramStore,
+    ) -> IambResult<EditInfo> {
+        let info = store.application.rooms.get_or_default(self.room_id.clone());
+
+        if let Some(key) = self.jump_target(info, &event_id) {
+            self.pending_jump = None;
+            self.scrollback.goto_message(key);
+            self.focus = RoomFocus::Scrollback;
+
+            return Ok(None);
+        }
+
+        store
+            .application
+            .need_load
+            .need_message(self.room_id.clone(), event_id.clone());
+        self.pending_jump = Some((event_id, Instant::now()));
+
+        let msg = "Loading message; will jump to it once it arrives";
+        Ok(Some(InfoMessage::from(msg)))
+    }
+
+    /// Finish a jump that was waiting on its message to load.
+    fn complete_pending_jump(&mut self, store: &mut ProgramStore) {
+        let Some((event_id, requested)) = &self.pending_jump else {
+            return;
+        };
+
+        let info = store.application.rooms.get_or_default(self.room_id.clone());
+
+        if let Some(key) = self.jump_target(info, event_id) {
+            self.pending_jump = None;
+            self.scrollback.goto_message(key);
+            self.focus = RoomFocus::Scrollback;
+        } else if matches!(info.fetch_id, RoomFetchStatus::Done) ||
+            requested.elapsed() >= PENDING_JUMP_TIMEOUT
+        {
+            // The whole history is loaded without it, or it's too far back to find.
+            self.pending_jump = None;
+
+            let msg = "Unable to jump to message: it's too far back in the room's history";
+            store.application.draw_error = Some(msg.into());
+        }
+    }
+
+    pub async fn timeline_command(
+        &mut self,
+        act: TimelineAction,
+        _: ProgramContext,
+        store: &mut ProgramStore,
+    ) -> IambResult<EditInfo> {
+        match act {
+            TimelineAction::GotoEvent(event_id) => self.jump_to_message(event_id, store),
+        }
+    }
+
     pub async fn message_command(
         &mut self,
         act: MessageAction,
@@ -160,9 +242,28 @@ impl ChatState {
                 }
 
                 if let Some(msgtype) = msg.event.msgtype() {
+                    // A location message has no attachment to download, so `:open`
+                    // hands its `geo:` URI over to the system handler, which will
+                    // let the desktop open it with an application of its choosing.
+                    if let Some(geo_uri) = location_geo_uri(msgtype) {
+                        if !flags.contains(DownloadFlags::OPEN) {
+                            return Err(IambError::NoAttachment.into());
+                        }
+
+                        let target = OsString::from(geo_uri.to_owned());
+
+                        return match open_command(
+                            store.application.settings.tunables.open_command.as_ref(),
+                            target,
+                        ) {
+                            Ok(_) => Ok(InfoMessage::from(format!("Opened {geo_uri}")).into()),
+                            Err(err) => Err(err),
+                        };
+                    }
+
                     let media = client.media();
                     let mut filename = match (filename, &settings.dirs.downloads) {
-                        (Some(f), _) => PathBuf::from(f),
+                        (Some(f), _) => f,
                         (None, Some(downloads)) => downloads.clone(),
                         (None, None) => return Err(IambError::NoDownloadDir.into()),
                     };
@@ -317,6 +418,8 @@ impl ChatState {
 
                         return Err(err);
                     },
+                    MessageEvent::Poll(ev) => ev.event_id().to_owned(),
+                    MessageEvent::UnstablePoll(ev) => ev.event_id().to_owned(),
                 };
 
                 if info.user_reactions_contains(&settings.profile.user_id, &event_id, &emoji) {
@@ -330,6 +433,69 @@ impl ChatState {
                 let msg = ReactionEventContent::new(reaction);
 
                 room.send_queue().send(msg.into()).await.map_err(IambError::from)?;
+
+                Ok(None)
+            },
+            MessageAction::Pin | MessageAction::Unpin => {
+                let pin = act == MessageAction::Pin;
+
+                let event_id = match &msg.event {
+                    MessageEvent::Local(..) => {
+                        let msg = "Cannot pin a message that hasn't been sent yet";
+                        return Err(UIError::Failure(msg.into()));
+                    },
+                    MessageEvent::Redacted(..) | MessageEvent::EncryptedRedacted(_) if pin => {
+                        let msg = "Cannot pin a redacted message";
+                        return Err(UIError::Failure(msg.into()));
+                    },
+                    event => {
+                        event
+                            .event_id()
+                            .map(ToOwned::to_owned)
+                            .ok_or(IambError::NoSelectedMessage)?
+                    },
+                };
+
+                let room = self.get_joined(&store.application.worker)?;
+
+                let can_pin = room
+                    .power_levels()
+                    .await
+                    .map_err(matrix_sdk::Error::from)
+                    .map_err(IambError::from)?
+                    .user_can_send_state(
+                        &settings.profile.user_id,
+                        StateEventType::RoomPinnedEvents,
+                    );
+
+                if !can_pin {
+                    return Err(IambError::InsufficientPermission.into());
+                }
+
+                // The state event holds the whole list, so rebuild it from the SDK's latest copy.
+                let mut pinned = room.pinned_event_ids().unwrap_or_default();
+                let position = pinned.iter().position(|id| *id == event_id);
+
+                match (pin, position) {
+                    (true, Some(_)) => {
+                        let msg = "This message is already pinned";
+                        return Err(UIError::Failure(msg.into()));
+                    },
+                    (false, None) => {
+                        let msg = "This message is not pinned";
+                        return Err(UIError::Failure(msg.into()));
+                    },
+                    (true, None) => {
+                        pinned.push(event_id);
+                    },
+                    (false, Some(idx)) => {
+                        pinned.remove(idx);
+                    },
+                }
+
+                room.send_state_event(RoomPinnedEventsEventContent::new(pinned))
+                    .await
+                    .map_err(IambError::from)?;
 
                 Ok(None)
             },
@@ -372,6 +538,8 @@ impl ChatState {
 
                         return Err(err);
                     },
+                    MessageEvent::Poll(ev) => ev.event_id().to_owned(),
+                    MessageEvent::UnstablePoll(ev) => ev.event_id().to_owned(),
                 };
 
                 let event_id = event_id.as_ref();
@@ -443,6 +611,8 @@ impl ChatState {
 
                         return Err(err);
                     },
+                    MessageEvent::Poll(ev) => ev.event_id().to_owned(),
+                    MessageEvent::UnstablePoll(ev) => ev.event_id().to_owned(),
                 };
 
                 let reactions = match info.reactions.get(&event_id) {
@@ -665,11 +835,10 @@ impl ChatState {
                     return Err(UIError::NeedConfirm(prompt));
                 }
 
-                let path = Path::new(file.as_str());
-                let mime = mime_guess::from_path(path).first_or(mime::APPLICATION_OCTET_STREAM);
+                let mime = mime_guess::from_path(&file).first_or(mime::APPLICATION_OCTET_STREAM);
 
-                let bytes = fs::read(path)?;
-                let name = path
+                let bytes = fs::read(&file)?;
+                let name = file
                     .file_name()
                     .map(OsStr::to_string_lossy)
                     .unwrap_or_else(|| Cow::from("Attachment"));
@@ -725,7 +894,13 @@ impl ChatState {
         if tunables.read_receipt_trigger.on_message() &&
             let Some(thread) = self.scrollback.get_thread(info)
         {
-            info.fully_read(settings.profile.user_id.clone(), thread.1.clone());
+            info.fully_read(
+                self.room_id.clone(),
+                thread.1.clone(),
+                &store.application.worker,
+                settings,
+                &mut store.application.open_notifications,
+            );
         }
 
         Ok(None)
@@ -844,6 +1019,7 @@ impl WindowOps<IambInfo> for ChatState {
 
             reply_to: None,
             editing: None,
+            pending_jump: None,
         }
     }
 
@@ -1078,6 +1254,8 @@ impl StatefulWidget for Chat<'_> {
     type State = ChatState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
+        state.complete_pending_jump(self.store);
+
         let settings = &self.store.application.settings;
 
         // Determine whether we have a description to show for the message bar.
@@ -1182,6 +1360,14 @@ impl StatefulWidget for Chat<'_> {
     }
 }
 
+/// Returns the `geo:` URI that a location message refers to.
+fn location_geo_uri(msgtype: &MessageType) -> Option<&str> {
+    match msgtype {
+        MessageType::Location(content) => Some(content.geo_uri()),
+        _ => None,
+    }
+}
+
 fn open_command(open_command: Option<&Vec<String>>, target: OsString) -> IambResult<()> {
     if let Some(mut cmd) = open_command.and_then(cmd) {
         cmd.arg(target);
@@ -1204,18 +1390,21 @@ fn extract_mentions(content: &TextMessageEventContent) -> Mentions {
     if !matches!(formatted.format, MessageFormat::Html) {
         return Mentions::new();
     }
-    let html = formatted.body.as_str();
+    extract_mentions_str(formatted.body.as_str())
+}
 
+fn extract_mentions_str(html: &str) -> Mentions {
     let re = Regex::new(r#"<a href="(https://matrix.to/#/@[^"]*:[^"]*)">"#).unwrap();
 
-    let user_ids = re.captures_iter(html).map(|capture| {
-        let link = capture.get(1).unwrap().as_str();
-        let uri = MatrixToUri::parse(link).unwrap();
-        let MatrixId::User(user_id) = uri.id() else {
-            // we only matched user links (starting with `@`)
-            unreachable!()
-        };
-        user_id.to_owned()
+    let user_ids = re.captures_iter(html).filter_map(|capture| {
+        let link = capture.get(1)?.as_str();
+        let uri = MatrixToUri::parse(link).ok()?;
+
+        if let MatrixId::User(user_id) = uri.id() {
+            Some(user_id.to_owned())
+        } else {
+            None
+        }
     });
 
     Mentions::with_user_ids(user_ids)
@@ -1312,6 +1501,88 @@ mod tests {
     use modalkit::actions::{EditAction, InsertTextAction};
 
     use crate::tests::{TEST_ROOM1_ID, mock_store};
+
+    fn mentions_in(html: &str) -> Vec<String> {
+        extract_mentions_str(html).user_ids.iter().map(|u| u.to_string()).collect()
+    }
+
+    #[test]
+    fn test_location_geo_uri() {
+        use matrix_sdk::ruma::events::room::message::{
+            LocationMessageEventContent,
+            TextMessageEventContent,
+        };
+
+        let location = MessageType::Location(LocationMessageEventContent::new(
+            "geo test".into(),
+            "geo:51.5072,-0.1276".into(),
+        ));
+        assert_eq!(location_geo_uri(&location), Some("geo:51.5072,-0.1276"));
+
+        let text = MessageType::Text(TextMessageEventContent::plain("not a location"));
+        assert_eq!(location_geo_uri(&text), None);
+    }
+
+    #[test]
+    fn test_extract_mentions_normal() {
+        let res = mentions_in(r#"<a href="https://matrix.to/#/@user:example.com">user</a>"#);
+        assert_eq!(res, vec!["@user:example.com"]);
+    }
+
+    #[test]
+    fn test_extract_mentions_ignore_parameters() {
+        let res =
+            mentions_in(r#"<a href="https://matrix.to/#/@user:example.com?via=example.com">u</a>"#);
+        assert_eq!(res, vec!["@user:example.com"]);
+    }
+
+    #[test]
+    fn test_extract_mentions_multiple_dedupe() {
+        let res = mentions_in(
+            r#"<a href="https://matrix.to/#/@a:example.com">a</a> and
+                   <a href="https://matrix.to/#/@b:example.com">b</a> and
+                   <a href="https://matrix.to/#/@a:example.com">a again</a>"#,
+        );
+        assert_eq!(res, vec!["@a:example.com", "@b:example.com"]);
+    }
+
+    #[test]
+    fn test_extract_mentions_skips_invalid_links() {
+        let empty = vec![
+            r#"<a href="https://matrix.to/#/@user:example.com/$eventid">e</a>"#,
+            r#"<a href="https://matrix.to/#/@bob:">bob</a>"#,
+            r#"<a href="https://matrix.to/#/@user:%E4%BE%8B.com">x</a>"#,
+        ];
+
+        for html in empty {
+            assert!(mentions_in(html).is_empty());
+        }
+
+        // An invalid link is ignored, but a valid one is still extracted:
+        assert_eq!(
+            mentions_in(
+                r#"<a href="https://matrix.to/#/@bob:">bob</a>
+                   <a href="https://matrix.to/#/@user:example.com">user</a>"#
+            ),
+            vec!["@user:example.com"]
+        );
+    }
+
+    #[test]
+    fn test_extract_mentions_ignores_unformatted() {
+        // URIs in plain text messages don't count as mentions:
+        let plain = TextMessageEventContent::plain(
+            r#"<a href="https://matrix.to/#/@user:example.com">user</a>"#,
+        );
+        assert!(extract_mentions(&plain).user_ids.is_empty());
+
+        // Links to things other than users aren't mentions:
+        let room = r#"<a href="https://matrix.to/#/#room:example.com">room</a>"#;
+        assert!(mentions_in(room).is_empty());
+
+        let nonmx = r#"<a href="https://example.com/@user:example.com">nope</a>"#;
+        assert!(mentions_in(nonmx).is_empty());
+    }
 
     macro_rules! move_line {
         ($dir: expr, $count: expr) => {

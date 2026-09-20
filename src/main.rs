@@ -26,7 +26,6 @@ use std::sync::atomic::AtomicUsize;
 use clap::{CommandFactory, Parser};
 use matrix_sdk::ruma::api::error::ErrorKind;
 use matrix_sdk::{OwnedServerName, RoomState};
-use matrix_sdk_crypto::encrypt_room_key_export;
 use modalkit::actions::{Commandable, TabAction, TabContainer, TabCount, WindowContainer};
 use modalkit::crossterm;
 use modalkit::crossterm::cursor::SetCursorStyle;
@@ -40,11 +39,8 @@ use modalkit_ratatui::cmdbar::CommandBarState;
 use modalkit_ratatui::screen::{Screen, ScreenState, TabbedLayoutDescription};
 use modalkit_ratatui::windows::{WindowLayoutDescription, WindowLayoutState};
 use modalkit_ratatui::{TerminalExtOps, Window};
-use rand::RngExt as _;
-use rand::distr::Alphanumeric;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use temp_dir::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::Level;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
@@ -66,7 +62,6 @@ mod message;
 mod notifications;
 mod prelude;
 mod preview;
-mod sled_export;
 mod util;
 mod verifications;
 mod windows;
@@ -327,6 +322,10 @@ impl Application {
 
         if store.application.ring_bell {
             store.application.ring_bell = term.backend_mut().write_all(&[7]).is_err();
+        }
+
+        if let Some(err) = store.application.draw_error.take() {
+            sstate.push_error(err);
         }
 
         if full {
@@ -591,14 +590,17 @@ impl Application {
 
         let info = match action {
             IambAction::ClearUnreads => {
-                let user_id = &store.application.settings.profile.user_id;
-
                 // Clear any notifications we displayed:
                 store.application.open_notifications.clear();
 
                 for room_id in store.application.sync_info.chats() {
                     if let Some(room) = store.application.rooms.get_mut(room_id) {
-                        room.fully_read_all(user_id);
+                        room.fully_read_all(
+                            room_id.to_owned(),
+                            &store.application.worker,
+                            &store.application.settings,
+                            &mut store.application.open_notifications,
+                        );
                     }
                 }
 
@@ -623,6 +625,9 @@ impl Application {
             },
             IambAction::Space(act) => {
                 self.screen.current_window_mut()?.space_command(act, ctx, store).await?
+            },
+            IambAction::Timeline(act) => {
+                self.screen.current_window_mut()?.timeline_command(act, ctx, store).await?
             },
             IambAction::Room(act) => {
                 let acts = self.screen.current_window_mut()?.room_command(act, ctx, store).await?;
@@ -678,6 +683,9 @@ impl Application {
                 };
 
                 return verifications::iamb_verify_request(user_id, store).await;
+            },
+            IambAction::Recover(key) => {
+                return verifications::iamb_recover(key, store).await;
             },
         };
 
@@ -886,10 +894,6 @@ impl Application {
     }
 }
 
-fn gen_passphrase() -> String {
-    rand::rng().sample_iter(&Alphanumeric).take(20).map(char::from).collect()
-}
-
 fn read_response(question: &str) -> String {
     println!("{question}");
     let mut input = String::new();
@@ -968,111 +972,6 @@ fn print_exit<T: Display, N>(v: T) -> N {
     process::exit(2);
 }
 
-// We can't access the OlmMachine directly, so write the keys to a temporary
-// file first, and then import them later.
-async fn check_import_keys(
-    settings: &ApplicationSettings,
-) -> IambResult<Option<(temp_dir::TempDir, String)>> {
-    let do_import = settings.sled_dir.is_dir() && !settings.sqlite_dir.is_dir();
-
-    if !do_import {
-        return Ok(None);
-    }
-
-    let question = format!(
-        "Found old sled store in {}. Would you like to export room keys from it? [y]es/[n]o",
-        settings.sled_dir.display()
-    );
-
-    loop {
-        match read_yesno(&question) {
-            Some('y') => {
-                break;
-            },
-            Some('n') => {
-                return Ok(None);
-            },
-            Some(_) | None => {
-                continue;
-            },
-        }
-    }
-
-    let keys = sled_export::export_room_keys(&settings.sled_dir).await?;
-    let passphrase = gen_passphrase();
-
-    println!("* Encrypting {} room keys with the passphrase {passphrase:?}...", keys.len());
-
-    let encrypted = match encrypt_room_key_export(&keys, &passphrase, 500000) {
-        Ok(encrypted) => encrypted,
-        Err(e) => {
-            eprintln!("* Failed to encrypt room keys during export: {e}");
-            process::exit(2);
-        },
-    };
-
-    let tmpdir = TempDir::new()?;
-    let exported = tmpdir.child("keys");
-
-    println!("* Writing encrypted room keys to {}...", exported.display());
-    tokio::fs::write(&exported, &encrypted).await?;
-
-    Ok(Some((tmpdir, passphrase)))
-}
-
-async fn login_upgrade(
-    keydir: TempDir,
-    passphrase: String,
-    worker: &Requester,
-    settings: &ApplicationSettings,
-    store: &AsyncProgramStore,
-) -> IambResult<()> {
-    println!(
-        "Please log in for {} to import the room keys into a new session",
-        settings.profile.user_id
-    );
-
-    login(worker, settings).await?;
-
-    println!("* Importing room keys...");
-
-    let exported = keydir.child("keys");
-    let imported = worker.client.encryption().import_room_keys(exported, &passphrase).await;
-
-    match imported {
-        Ok(res) => {
-            println!(
-                "* Successfully imported {} out of {} keys",
-                res.imported_count, res.total_count
-            );
-            let _ = keydir.cleanup();
-        },
-        Err(e) => {
-            println!(
-                "Failed to import room keys from {}/keys: {e}\n\n\
-                They have been encrypted with the passphrase {passphrase:?}.\
-                Please save them and try importing them manually instead\n",
-                keydir.path().display()
-            );
-
-            loop {
-                match read_yesno("Would you like to continue logging in? [y]es/[n]o") {
-                    Some('y') => break,
-                    Some('n') => print_exit("* Exiting..."),
-                    Some(_) | None => continue,
-                }
-            }
-        },
-    }
-
-    println!("* Syncing...");
-    worker::do_first_sync(&worker.client, store)
-        .await
-        .map_err(IambError::from)?;
-
-    Ok(())
-}
-
 async fn login_normal(
     worker: &Requester,
     settings: &ApplicationSettings,
@@ -1096,16 +995,13 @@ async fn run(
     // setup_tty() and pop in restore_tty().
     settings.probe_enhanced_keys();
 
-    // Get old keys the first time we run w/ the upgraded SDK.
-    let import_keys = check_import_keys(&settings).await?;
-
     // Set up client state.
     create_dir_all(settings.sqlite_dir.as_path())?;
     let client = worker::create_client(&settings).await;
 
     // Set up the async worker thread and global store.
     let worker = ClientWorker::spawn(client.clone(), settings.clone()).await;
-    let store = ChatStore::new(worker.clone(), settings.clone());
+    let store = ChatStore::new(worker.clone(), settings.clone())?;
     let mut store = Store::new(store);
     store.completer = Box::new(IambCompleter);
 
@@ -1117,11 +1013,7 @@ async fn run(
     let store = Arc::new(AsyncMutex::new(store));
     worker.init(store.clone());
 
-    let res = if let Some((keydir, pass)) = import_keys {
-        login_upgrade(keydir, pass, &worker, &settings, &store).await
-    } else {
-        login_normal(&worker, &settings, &store).await
-    };
+    let res = login_normal(&worker, &settings, &store).await;
 
     match res {
         Err(UIError::Application(IambError::Matrix(e))) => {

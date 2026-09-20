@@ -87,8 +87,9 @@ pub use crate::base::{
     RoomInfo,
     SendAction,
     SpaceAction,
+    TimelineAction,
 };
-pub use crate::config::ApplicationSettings;
+pub use crate::config::{Aliases, ApplicationSettings};
 pub use crate::message::{Message, MessageEvent, MessageKey, MessageTimeStamp, Messages};
 pub use crate::preview::{PreviewKind, PreviewManager};
 pub use crate::worker::Requester;
