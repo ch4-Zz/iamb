@@ -50,10 +50,6 @@ lazy_static! {
     };
 }
 
-pub fn user_style(user: &str) -> Style {
-    user_style_from_color(user_color(user))
-}
-
 pub fn mock_room1_message(
     content: RoomMessageEventContent,
     sender: OwnedUserId,
@@ -162,6 +158,7 @@ pub fn mock_tunables() -> TunableValues {
         input_prompt: None,
         log_level: "warn".into(),
         max_log_files: 7,
+        message_formatted_display: true,
         message_shortcode_display: false,
         normal_after_send: true,
         proxy: Proxy::default().values(),
@@ -174,11 +171,12 @@ pub fn mock_tunables() -> TunableValues {
         sort: SortOverrides::default().values(),
         list_colors: ListColorValues::default(),
         state_event_display: true,
+        sync_delay_ms: 1000,
         terminal: Terminal::default().values(),
         typing_notice_send: true,
         typing_notice_display: true,
         users: vec![(TEST_USER5.clone(), UserDisplayTunables {
-            color: Some(UserColor(Color::Black)),
+            color: Some(Color::Black),
             name: Some("USER 5".into()),
         })]
         .into_iter()
@@ -201,6 +199,7 @@ pub fn mock_tunables() -> TunableValues {
         default_split: Default::default(),
         ssl_verify: true,
         cache_policy: Default::default(),
+        send_on_enter: true,
     }
 }
 
@@ -223,12 +222,14 @@ pub fn mock_settings() -> ApplicationSettings {
             layout: None,
             macros: None,
             aliases: None,
+            theme: None,
         },
         tunables: mock_tunables(),
         dirs: mock_dirs(),
         layout: Default::default(),
         macros: HashMap::default(),
         aliases: Aliases::default(),
+        theme: crate::config::theme::default_theme().values().into(),
         enable_enhanced_keys: false,
     }
 }
@@ -258,7 +259,7 @@ pub async fn mock_store() -> ProgramStore {
     let info = mock_room();
 
     store.rooms.insert(room_id.clone(), info);
-    store.names.insert(TEST_ROOM1_ALIAS.clone(), room_id);
+    store.aliases.insert(TEST_ROOM1_ALIAS.clone(), room_id);
 
     ProgramStore::new(store)
 }

@@ -24,8 +24,8 @@ use std::process;
 use std::sync::atomic::AtomicUsize;
 
 use clap::{CommandFactory, Parser};
+use matrix_sdk::OwnedServerName;
 use matrix_sdk::ruma::api::error::ErrorKind;
-use matrix_sdk::{OwnedServerName, RoomState};
 use modalkit::actions::{Commandable, TabAction, TabContainer, TabCount, WindowContainer};
 use modalkit::crossterm;
 use modalkit::crossterm::cursor::SetCursorStyle;
@@ -76,20 +76,17 @@ fn config_tab_to_desc(
 ) -> IambResult<WindowLayoutDescription<IambInfo>> {
     let desc = match layout {
         config::WindowLayout::Window { window } => {
-            let ChatStore { names, worker, settings, .. } = &mut store.application;
-            let via = settings.tunables.default_via.clone();
-
             let window = match window {
                 config::WindowPath::UserId(user_id) => {
-                    let room_id = worker.join_room(user_id.to_string(), via)?;
-                    IambId::Room(room_id, None)
+                    if let Some(dm) = store.application.worker.client.get_dm_room(&user_id) {
+                        IambId::Room(dm.room_id().to_owned().into(), None)
+                    } else {
+                        let room_id = store.application.worker.create_dm(user_id)?;
+                        IambId::Room(room_id.into(), None)
+                    }
                 },
-                config::WindowPath::RoomId(room_id) => IambId::Room(room_id, None),
-                config::WindowPath::AliasId(alias) => {
-                    let room_id = worker.join_room(alias.to_string(), via)?;
-                    names.insert(alias, room_id.clone());
-                    IambId::Room(room_id, None)
-                },
+                config::WindowPath::RoomId(room_id) => IambId::Room(room_id.into(), None),
+                config::WindowPath::AliasId(alias_id) => IambId::Room(alias_id.into(), None),
                 config::WindowPath::Window(id) => id,
             };
 
@@ -119,66 +116,40 @@ fn restore_layout(
     tabs.to_layout(area.into(), store)
 }
 
-/// Returns the `IambId` for the new window or a string to query the user. If they answer `y` this
-/// function should be rerun with `join_or_create` set to `true`.
 fn resolve_mxid(
     store: &mut ProgramStore,
     id: MatrixId,
-    via: &[OwnedServerName],
-    join_or_create: bool,
-) -> IambResult<Result<IambId, String>> {
-    let room_name;
-    let room_id = match id {
-        MatrixId::Room(id) => {
-            room_name = id.to_string();
-            id
-        },
-        MatrixId::RoomAlias(alias_id) => {
-            room_name = alias_id.to_string();
-            store.application.worker.resolve_alias(alias_id)?
+    via: Vec<OwnedServerName>,
+) -> IambResult<IambId> {
+    let alias_id = match id {
+        MatrixId::Room(room_id) => room_id.into(),
+        MatrixId::RoomAlias(alias) => {
+            if let Some(room_id) = store.application.aliases.get(&alias) {
+                room_id.to_owned().into()
+            } else {
+                alias.into()
+            }
         },
         MatrixId::User(user_id) => {
-            let id = match store.application.worker.client.get_dm_room(&user_id) {
-                Some(room) => room.room_id().to_owned(),
-                None if join_or_create => {
-                    store.application.worker.join_room(user_id.to_string(), via.to_owned())?
-                },
-                None => return Ok(Err(format!("No dm with {user_id} found. Create new DM?"))),
-            };
-            room_name = id.to_string();
-            id
-        },
-        MatrixId::Event(owned_room_or_alias_id, _event_id) => {
-            // ignore event id for now
-            room_name = owned_room_or_alias_id.to_string();
-            let room_or_alias_id: &matrix_sdk::ruma::RoomOrAliasId = &owned_room_or_alias_id;
-            if let Ok(alias_id) = <&matrix_sdk::ruma::RoomAliasId>::try_from(room_or_alias_id) {
-                store.application.worker.resolve_alias(alias_id.to_owned())?
+            if let Some(dm) = store.application.worker.client.get_dm_room(&user_id) {
+                dm.room_id().to_owned().into()
             } else {
-                matrix_sdk::ruma::OwnedRoomId::try_from(owned_room_or_alias_id).unwrap()
+                store.application.worker.create_dm(user_id.to_owned())?.into()
             }
+        },
+        MatrixId::Event(alias_id, _) => {
+            // ignore event id for now
+            alias_id
         },
         _ => {
             tracing::error!("encountered unrecoginsed matrix id: {id:?}");
-            return Ok(Err("Matrix link cannot be opened. Press 'n' to continue.".to_owned()));
+            return Err(UIError::Failure("Matrix link cannot be opened.".to_string()));
         },
     };
 
-    if store
-        .application
-        .worker
-        .client
-        .get_room(&room_id)
-        .is_none_or(|room| room.state() != RoomState::Joined)
-    {
-        if join_or_create {
-            store.application.worker.join_room(room_name, via.to_owned())?;
-        } else {
-            return Ok(Err(format!("Join room {room_name:?}?")));
-        }
-    }
+    store.application.room_via.insert(alias_id.to_owned(), via);
 
-    Ok(Ok(IambId::Room(room_id, None)))
+    Ok(IambId::Room(alias_id, None))
 }
 
 fn setup_screen(
@@ -191,24 +162,12 @@ fn setup_screen(
     let area = Rect::new(0, 0, dims.0, dims.1);
 
     if let Some((id, via)) = initial_room {
-        match resolve_mxid(store, id.clone(), &via, false)? {
+        match resolve_mxid(store, id, via) {
             Ok(id) => {
                 return Ok(ScreenState::new(IambWindow::open(id, store)?, cmd));
             },
-            Err(question) => {
-                restore_tty(false, settings.tunables.mouse.enabled);
-                let join_or_create = loop {
-                    match read_yesno(&format!("{question} [y]es/[n]o")) {
-                        Some('y') => break true,
-                        Some('n') => break false,
-                        Some(_) | None => continue,
-                    }
-                };
-                setup_tty(&settings)?;
-
-                if join_or_create && let Ok(id) = resolve_mxid(store, id, &via, true)? {
-                    return Ok(ScreenState::new(IambWindow::open(id, store)?, cmd));
-                }
+            Err(err) => {
+                store.application.draw_error = Some(format!("layout restore: {err}"));
             },
         }
     }
@@ -257,6 +216,9 @@ struct Application {
     /// State for the Matrix client, editing, etc.
     store: AsyncProgramStore,
 
+    /// Clone of the currently selected theme.
+    theme: Arc<ThemeValues>,
+
     /// UI state (open tabs, command bar, etc.) to use when rendering.
     screen: ScreenState<IambWindow, IambInfo>,
 
@@ -287,8 +249,9 @@ impl Application {
     ) -> IambResult<Application> {
         let backend = CrosstermBackend::new(stdout());
         let terminal = Terminal::new(backend)?;
+        let theme = settings.theme.clone();
 
-        let mut bindings = crate::keybindings::setup_keybindings();
+        let mut bindings = crate::keybindings::setup_keybindings(&settings.tunables);
         settings.setup(&mut bindings);
         let bindings = KeyManager::new(bindings);
 
@@ -305,6 +268,7 @@ impl Application {
             store,
             worker,
             terminal,
+            theme,
             bindings,
             actstack,
             screen,
@@ -332,6 +296,8 @@ impl Application {
             term.clear()?;
         }
 
+        let theme = store.application.settings.theme.clone();
+
         term.draw(|f| {
             let area = f.area();
 
@@ -347,9 +313,17 @@ impl Application {
                 .show_dialog(dialogstr)
                 .show_mode(modestr)
                 .borders(true)
-                .border_style(Style::default().add_modifier(StyleModifier::DIM))
-                .tab_style(Style::default().add_modifier(StyleModifier::DIM))
-                .tab_style_focused(Style::default().remove_modifier(StyleModifier::DIM))
+                .border_style(theme.windows.border)
+                .border_style_focused(theme.windows.border_focused)
+                .border_type(theme.windows.border_line)
+                .border_type_focused(theme.windows.border_focused_line)
+                .cmdbar_style(theme.cmdbar.default)
+                .cmdbar_completions_style(theme.cmdbar.completions)
+                .cmdbar_prompt_style(theme.cmdbar.prompt)
+                .tab_style(theme.tabs.title)
+                .tab_style_focused(theme.tabs.title_focused)
+                .completion_style(theme.completion.default)
+                .completion_style_selected(theme.completion.selected)
                 .focus(focused);
             f.render_stateful_widget(screen, area, sstate);
 
@@ -423,7 +397,8 @@ impl Application {
                             self.handle_info(info);
                         },
                         Err(e) => {
-                            self.screen.push_error(e);
+                            drop(store);
+                            self.handle_error(e);
                         },
                     }
                 },
@@ -453,7 +428,8 @@ impl Application {
                             self.handle_info(info);
                         },
                         Err(e) => {
-                            self.screen.push_error(e);
+                            drop(store);
+                            self.handle_error(e);
                         },
                     }
                 },
@@ -635,6 +611,12 @@ impl Application {
 
                 None
             },
+            IambAction::Join(act) => {
+                let acts = self.screen.current_window_mut()?.join_command(act, ctx, store).await?;
+                self.action_prepend(acts);
+
+                None
+            },
             IambAction::Send(act) => {
                 if store.application.settings.tunables.normal_after_send {
                     self.bindings.reset_mode();
@@ -642,7 +624,7 @@ impl Application {
                 self.screen.current_window_mut()?.send_command(act, ctx, store).await?
             },
 
-            IambAction::OpenLink(url, join_or_create) => {
+            IambAction::OpenLink(url) => {
                 let matrix_uri = MatrixUri::parse(&url).ok();
                 let matrix_to_uri = MatrixToUri::parse(&url).ok();
 
@@ -652,20 +634,15 @@ impl Application {
                     .or(matrix_to_uri.as_ref().map(|uri| (uri.id(), uri.via())));
 
                 if let Some((id, via)) = matrix_id {
-                    match resolve_mxid(store, id.clone(), via, join_or_create)? {
-                        Ok(room) => {
-                            let target = OpenTarget::Application(room);
+                    match resolve_mxid(store, id.to_owned(), via.to_vec()) {
+                        Ok(id) => {
+                            let target = OpenTarget::Application(id);
                             let action = WindowAction::Switch(target);
 
                             self.action_prepend(vec![(action.into(), ctx)]);
                             None
                         },
-                        Err(prompt) => {
-                            let act = IambAction::OpenLink(url, true).into();
-                            let dialog = PromptYesNo::new(prompt, vec![act]);
-                            let err = UIError::NeedConfirm(Box::new(dialog));
-                            return Err(err);
-                        },
+                        Err(err) => return Err(UIError::Failure(err.to_string())),
                     }
                 } else {
                     tokio::task::spawn_blocking(move || open::that(url));
@@ -702,7 +679,7 @@ impl Application {
             HomeserverAction::CreateRoom(alias, vis, flags) => {
                 let client = &store.application.worker.client;
                 let room_id = create_room(client, alias, vis, flags).await?;
-                let room = IambId::Room(room_id, None);
+                let room = IambId::Room(room_id.into(), None);
                 let target = OpenTarget::Application(room);
                 let action = WindowAction::Switch(target);
 
@@ -825,13 +802,17 @@ impl Application {
     fn handle_info(&mut self, info: InfoMessage) {
         match info {
             InfoMessage::Message(info) => {
-                self.screen.push_info(info);
+                self.screen.push_message(info, self.theme.cmdbar.info);
             },
             InfoMessage::Pager(text) => {
                 let pager = Box::new(Pager::new(text, vec![]));
                 self.bindings.run_dialog(pager);
             },
         }
+    }
+
+    fn handle_error(&mut self, err: impl ToString) {
+        self.screen.push_message(err, self.theme.cmdbar.error);
     }
 
     pub async fn run(&mut self) -> Result<(), std::io::Error> {
@@ -867,7 +848,7 @@ impl Application {
                         continue;
                     },
                     Err(e) => {
-                        self.screen.push_error(e);
+                        self.handle_error(e);
 
                         // Skip processing any more keypress Actions until the next key.
                         keyskip = true;
@@ -899,10 +880,6 @@ fn read_response(question: &str) -> String {
     let mut input = String::new();
     let _ = std::io::stdin().read_line(&mut input);
     input
-}
-
-fn read_yesno(question: &str) -> Option<char> {
-    read_response(question).chars().next().map(|c| c.to_ascii_lowercase())
 }
 
 async fn login(worker: &Requester, settings: &ApplicationSettings) -> IambResult<()> {

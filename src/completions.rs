@@ -188,8 +188,6 @@ mod parse {
     pub fn parse_started_strings(input: &str) -> IResult<&str, (Vec<String>, &str)> {
         let (input, (mut args, mut last_arg_raw)) =
             separated_list0_last_raw(space1, parse_string).parse(input)?;
-        // let (input, mut args) = separated_list0_last_raw(space1, parse_string).parse(input)?;
-        // let last_arg_raw = todo!();
 
         let (input, end_arg) = if args.is_empty() {
             opt(parse_last_arg).parse(input)?
@@ -263,7 +261,7 @@ fn complete_users(input: &str, store: &ChatStore) -> Vec<String> {
 
 /// Tab completion for Matrix identifiers (usernames, room aliases, etc.)
 fn complete_matrix_names(input: &str, store: &ChatStore) -> Vec<String> {
-    let list = store.names.complete(input);
+    let list = store.aliases.complete(input);
     if !list.is_empty() {
         return list.into_iter().map(|i| i.to_string()).collect();
     }
@@ -278,7 +276,7 @@ fn complete_matrix_names(input: &str, store: &ChatStore) -> Vec<String> {
 
 /// Tab completion for known room aliases and ids.
 fn complete_room_alias_or_id(input: &str, store: &ChatStore) -> Vec<String> {
-    let list = store.names.complete(input);
+    let list = store.aliases.complete(input);
     if !list.is_empty() {
         return list.into_iter().map(|i| i.to_string()).collect();
     }
@@ -409,7 +407,7 @@ fn complete_iamb_create(args: Vec<String>) -> Vec<String> {
 }
 
 /// Tab completion for `:room`
-// TODO: Check whether we can get the id of the focused room to improve
+// XXX: Check whether we can get the id of the focused room to improve
 // "kick","ban","unban", ".. unset" and "dm/tag set/unset"
 fn complete_iamb_room(args: Vec<String>, store: &ChatStore) -> Vec<String> {
     let subcmds = [
@@ -602,7 +600,7 @@ fn complete_cmdarg(
 
         "space" => complete_iamb_space(args, store),
 
-        // TODO: Check whether we can get the id of the focused message to improve completion
+        // XXX: Check whether we can get the id of the focused message to improve completion
         "unreact" if args.len() == 1 => complete_emoji(&args[0], store),
         "unreact" => vec![],
 
@@ -724,7 +722,7 @@ fn complete_msgbar(
             }
 
             store
-                .names
+                .aliases
                 .complete(id.as_ref())
                 .into_iter()
                 .map(|i| format!("[{}]", i))
@@ -779,7 +777,12 @@ impl Completer<IambInfo> for IambCompleter {
     ) -> Vec<String> {
         match content {
             IambBufferId::Command(CommandType::Command) => complete_cmdbar(text, cursor, store),
-            IambBufferId::Command(CommandType::Search) => vec![],
+            IambBufferId::Command(
+                CommandType::Application |
+                CommandType::Content |
+                CommandType::Search |
+                CommandType::Shell,
+            ) => vec![],
             IambBufferId::Room(room_id, _, RoomFocus::MessageBar) => {
                 complete_msgbar(text, cursor, store, room_id)
             },

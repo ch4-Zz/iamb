@@ -13,16 +13,11 @@ use matrix_sdk::ruma::events::RedactedUnsigned;
 use matrix_sdk::ruma::events::poll::start::RedactedPollStartEvent;
 use matrix_sdk::ruma::events::poll::unstable_start::RedactedUnstablePollStartEvent;
 use matrix_sdk::ruma::events::room::encrypted::{
-    OriginalRoomEncryptedEvent,
-    RedactedRoomEncryptedEvent,
-    RoomEncryptedEvent,
+    OriginalRoomEncryptedEvent, RedactedRoomEncryptedEvent, RoomEncryptedEvent,
 };
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContentWithoutRelation;
 use matrix_sdk::ruma::events::room::message::{
-    FormattedBody,
-    MessageFormat,
-    RedactedRoomMessageEvent,
-    RoomMessageEvent,
+    FormattedBody, MessageFormat, RedactedRoomMessageEvent, RoomMessageEvent,
 };
 use matrix_sdk::ruma::events::room::redaction::SyncRoomRedactionEvent;
 use matrix_sdk::ruma::events::sticker::{OriginalStickerEvent, RedactedStickerEvent, StickerEvent};
@@ -117,14 +112,6 @@ const fn span_static(s: &'static str) -> Span<'static> {
     }
 }
 
-const BOLD_STYLE: Style = Style {
-    fg: None,
-    bg: None,
-    add_modifier: StyleModifier::BOLD,
-    sub_modifier: StyleModifier::empty(),
-    underline_color: None,
-};
-
 const TIME_GUTTER: usize = 12;
 const READ_GUTTER: usize = 5;
 const MIN_MSG_LEN: usize = 30;
@@ -166,9 +153,9 @@ fn placeholder_frame(
     placeholder.push('\u{230d}');
     placeholder.push_str(&"\n".repeat((*height as usize - 1) / 2));
 
-    if *height > 2 &&
-        let Some(text) = text &&
-        text.width() <= width - 2
+    if *height > 2
+        && let Some(text) = text
+        && text.width() <= width - 2
     {
         placeholder.push(' ');
         placeholder.push_str(text);
@@ -228,10 +215,10 @@ impl MessageTimeStamp {
         dt1.date_naive() == dt2.date_naive()
     }
 
-    fn show_date(self) -> Span<'static> {
+    fn show_date(self, settings: &ApplicationSettings) -> Span<'static> {
         let time = self.as_datetime().format("%A, %B %d %Y").to_string();
 
-        Span::styled(time, BOLD_STYLE)
+        Span::styled(time, settings.theme.timeline.date)
     }
 
     /// A compact date and time, for places without a date separator line.
@@ -239,11 +226,11 @@ impl MessageTimeStamp {
         self.as_datetime().format("%Y-%m-%d %H:%M").to_string()
     }
 
-    fn show_time(self) -> Span<'static> {
+    fn show_time(self, settings: &ApplicationSettings) -> Span<'static> {
         let time = self.as_datetime().format("%T");
         let time = format!("  [{time}]");
 
-        Span::raw(time)
+        Span::styled(time, settings.theme.timeline.time)
     }
 }
 
@@ -441,20 +428,18 @@ impl MessageEvent {
 
     pub fn msgtype(&self) -> Option<&MessageType> {
         match self {
-            MessageEvent::Original(ev, edits) => {
-                edits
-                    .last_key_value()
-                    .map(|(_, ev)| &ev.msgtype)
-                    .or(Some(&ev.content.msgtype))
-            },
+            MessageEvent::Original(ev, edits) => edits
+                .last_key_value()
+                .map(|(_, ev)| &ev.msgtype)
+                .or(Some(&ev.content.msgtype)),
             MessageEvent::Local(_, _, content) => Some(&content.msgtype),
-            MessageEvent::EncryptedOriginal(..) |
-            MessageEvent::EncryptedRedacted(..) |
-            MessageEvent::Redacted(..) |
-            MessageEvent::State(..) |
-            MessageEvent::Sticker(..) |
-            MessageEvent::Poll(..) |
-            MessageEvent::UnstablePoll(..) => None,
+            MessageEvent::EncryptedOriginal(..)
+            | MessageEvent::EncryptedRedacted(..)
+            | MessageEvent::Redacted(..)
+            | MessageEvent::State(..)
+            | MessageEvent::Sticker(..)
+            | MessageEvent::Poll(..)
+            | MessageEvent::UnstablePoll(..) => None,
         }
     }
 
@@ -490,6 +475,33 @@ impl MessageEvent {
 
     pub fn filename(&self) -> Option<String> {
         self.msgtype().and_then(content_filename)
+    }
+
+    fn message_style(&self, settings: &ApplicationSettings) -> Style {
+        let content = match self {
+            MessageEvent::EncryptedOriginal(_) | MessageEvent::EncryptedRedacted(_) => {
+                return settings.theme.timeline.default;
+            },
+            MessageEvent::Redacted(..) => return settings.theme.timeline.redacted,
+            MessageEvent::State(_) => return settings.theme.timeline.state,
+            MessageEvent::Original(ev, _) => &ev.content,
+            MessageEvent::Local(_, _, content) => content,
+            MessageEvent::Sticker(..) => return settings.theme.timeline.sticker,
+            MessageEvent::Poll(..) | MessageEvent::UnstablePoll(..) => {
+                return settings.theme.timeline.poll;
+            },
+        };
+
+        match &content.msgtype {
+            MessageType::Text(_)
+            | MessageType::Audio(_)
+            | MessageType::Emote(_)
+            | MessageType::File(_)
+            | MessageType::Image(_)
+            | MessageType::Video(_) => settings.theme.messages.default,
+            MessageType::Notice(_) | MessageType::ServerNotice(_) => settings.theme.timeline.notice,
+            _ => settings.theme.messages.default,
+        }
     }
 
     fn redact(&mut self, redaction: SyncRoomRedactionEvent) {
@@ -726,7 +738,7 @@ impl<'a> MessageFormatter<'a> {
     #[inline]
     fn push_spans(&mut self, prev_line: Line<'a>, style: Style, text: &mut Text<'a>) {
         if std::mem::take(&mut self.trackbar) {
-            let trackbar_style = Style::default().add_modifier(StyleModifier::DIM);
+            let trackbar_style = self.settings.theme.timeline.unread_marker;
             text.lines
                 .push(Line::from(Span::styled(HORIZONTAL.repeat(self.orig), trackbar_style)));
         }
@@ -820,7 +832,7 @@ impl<'a> MessageFormatter<'a> {
         let reply_style = if settings.tunables.message_user_color {
             style.patch(settings.get_user_color(&msg.sender))
         } else {
-            style
+            style.patch(msg.event.message_style(settings))
         };
 
         let width = self.width();
@@ -933,14 +945,13 @@ impl<'a> MessageFormatter<'a> {
         protos
     }
 
-    fn push_thread_reply_count(&mut self, len: usize, text: &mut Text<'a>) {
+    fn push_thread_reply_count(&mut self, len: usize, text: &mut Text<'a>, style: Style) {
         if len == 0 {
             return;
         }
 
         // If we have threaded replies to this message, show how many.
         let plural = len != 1;
-        let style = Style::default();
         let mut threaded =
             printer::TextPrinter::new(self.width(), style, self.settings, self.info).literal(true);
         let len = Span::styled(len.to_string(), style.add_modifier(StyleModifier::BOLD));
@@ -1056,7 +1067,7 @@ impl Message {
     }
 
     fn get_render_style(&self, selected: bool, settings: &ApplicationSettings) -> Style {
-        let mut style = Style::default();
+        let mut style = self.event.message_style(settings);
 
         if selected {
             style = style.add_modifier(StyleModifier::REVERSED)
@@ -1113,8 +1124,8 @@ impl Message {
         let width = viewctx.get_width();
         let user_gutter = settings.tunables.user_gutter_width;
 
-        if user_gutter + TIME_GUTTER + READ_GUTTER + MIN_MSG_LEN <= width &&
-            settings.tunables.read_receipt_display
+        if user_gutter + TIME_GUTTER + READ_GUTTER + MIN_MSG_LEN <= width
+            && settings.tunables.read_receipt_display
         {
             width - user_gutter - TIME_GUTTER - READ_GUTTER
         } else if user_gutter + TIME_GUTTER + MIN_MSG_LEN <= width {
@@ -1134,17 +1145,17 @@ impl Message {
         settings: &'a ApplicationSettings,
     ) -> MessageFormatter<'a> {
         let orig = width;
-        let date = self.show_date(prev).then(|| self.timestamp.show_date());
+        let date = self.show_date(prev).then(|| self.timestamp.show_date(settings));
         let trackbar = self.show_trackbar(prev, info, settings);
         let user_gutter = settings.tunables.user_gutter_width;
 
-        if user_gutter + TIME_GUTTER + READ_GUTTER + MIN_MSG_LEN <= width &&
-            settings.tunables.read_receipt_display
+        if user_gutter + TIME_GUTTER + READ_GUTTER + MIN_MSG_LEN <= width
+            && settings.tunables.read_receipt_display
         {
             let cols = MessageColumns::Four;
             let fill = width - user_gutter - TIME_GUTTER - READ_GUTTER;
             let user = self.show_sender(prev, true, info, settings, width);
-            let time = Some(self.timestamp.show_time());
+            let time = Some(self.timestamp.show_time(settings));
             let read = self
                 .event
                 .event_id()
@@ -1180,7 +1191,7 @@ impl Message {
             let cols = MessageColumns::Three;
             let fill = width - user_gutter - TIME_GUTTER;
             let user = self.show_sender(prev, true, info, settings, width);
-            let time = Some(self.timestamp.show_time());
+            let time = Some(self.timestamp.show_time(settings));
             let read = Vec::new();
 
             MessageFormatter {
@@ -1327,7 +1338,7 @@ impl Message {
         }
 
         if let Some(thread) = self.event.event_id().and_then(|id| info.get_thread(Some(id))) {
-            fmt.push_thread_reply_count(thread.len(), &mut text);
+            fmt.push_thread_reply_count(thread.len(), &mut text, style);
         }
 
         (text, protos)
@@ -1386,7 +1397,9 @@ impl Message {
             text += wrapped_text(filename, width, style);
         }
 
-        if let Some(html) = &self.html {
+        if let Some(html) = &self.html
+            && settings.tunables.message_formatted_display
+        {
             text += html.to_text(width, style, settings, info);
         } else {
             let mut msg = self.event.body();
@@ -1415,10 +1428,10 @@ impl Message {
         settings: &'a ApplicationSettings,
         width: usize,
     ) -> SenderSpan<'a> {
-        if let Some(prev) = prev &&
-            self.sender == prev.sender &&
-            self.timestamp.same_day(prev.timestamp) &&
-            !matches!(self.event.msgtype(), Some(MessageType::Emote(_)))
+        if let Some(prev) = prev
+            && self.sender == prev.sender
+            && self.timestamp.same_day(prev.timestamp)
+            && !matches!(self.event.msgtype(), Some(MessageType::Emote(_)))
         {
             return SenderSpan::None;
         }
@@ -1621,13 +1634,8 @@ pub mod tests {
 
     use matrix_sdk::ruma::events::room::ImageInfo;
     use matrix_sdk::ruma::events::room::message::{
-        AudioInfo,
-        AudioMessageEventContent,
-        FileInfo,
-        FileMessageEventContent,
-        ImageMessageEventContent,
-        VideoInfo,
-        VideoMessageEventContent,
+        AudioInfo, AudioMessageEventContent, FileInfo, FileMessageEventContent,
+        ImageMessageEventContent, VideoInfo, VideoMessageEventContent,
     };
 
     use crate::base::EventLocation;
@@ -2035,5 +2043,40 @@ pub mod tests {
         info.user_receipts.remove(&ReceiptThread::Thread(root));
         info.set_receipt(ReceiptThread::Main, user_id, MSG1_EVID.clone());
         assert!(!msg.show_trackbar(Some(&prev), &info, &settings));
+    }
+
+    #[test]
+    fn test_show_msg_html_display() {
+        let mut settings = mock_settings();
+        let previews = PreviewManager::new(&settings);
+        let info = mock_room();
+
+        let content = RoomMessageEventContent::text_html(
+            "**hello** <world>",
+            "<strong>hello</strong> &lt;world&gt;",
+        );
+        let msg = mock_room1_message(content, TEST_USER1.clone(), MSG1_KEY.clone());
+
+        let render = |settings: &ApplicationSettings| -> String {
+            let (text, _) = msg.show_msg(60, Style::default(), settings, &previews, &info);
+
+            let s: String = text
+                .lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect();
+
+            // The HTML renderer pads lines out to the full width.
+            s.trim_end().to_string()
+        };
+
+        // By default, the formatted HTML body is rendered.
+        assert!(settings.tunables.message_formatted_display);
+        assert_eq!(render(&settings), "hello <world>");
+
+        // When disabled, the plain text body is shown exactly as it was sent.
+        settings.tunables.message_formatted_display = false;
+        assert_eq!(render(&settings), "**hello** <world>");
     }
 }

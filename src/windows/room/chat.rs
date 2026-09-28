@@ -16,11 +16,7 @@ use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::ruma::events::reaction::ReactionEventContent;
 use matrix_sdk::ruma::events::relation::Annotation;
 use matrix_sdk::ruma::events::room::message::{
-    AddMentions,
-    ForwardThread,
-    MessageFormat,
-    ReplyWithinThread,
-    TextMessageEventContent,
+    AddMentions, ForwardThread, MessageFormat, ReplyWithinThread, TextMessageEventContent,
 };
 use matrix_sdk::ruma::events::room::pinned_events::RoomPinnedEventsEventContent;
 use matrix_sdk::send_queue::RoomSendQueueError;
@@ -32,13 +28,10 @@ use modalkit_ratatui::textbox::{TextBox, TextBoxState};
 use ratatui::prelude::Stylize;
 use regex::Regex;
 
-use crate::base::{DownloadFlags, EchoLocation, RoomFetchStatus};
+use crate::base::{DownloadFlags, EchoLocation};
 use crate::config::EncryptionIndicatorLocation;
 use crate::message::{
-    MessageId,
-    TreeGenState,
-    text_to_message,
-    text_to_text_message_event_content,
+    MessageId, TreeGenState, text_to_message, text_to_text_message_event_content,
 };
 use crate::prelude::*;
 use crate::util::SuspendedTty;
@@ -182,9 +175,7 @@ impl ChatState {
             self.pending_jump = None;
             self.scrollback.goto_message(key);
             self.focus = RoomFocus::Scrollback;
-        } else if matches!(info.fetch_id, RoomFetchStatus::Done) ||
-            requested.elapsed() >= PENDING_JUMP_TIMEOUT
-        {
+        } else if info.reached_timeline_start || requested.elapsed() >= PENDING_JUMP_TIMEOUT {
             // The whole history is loaded without it, or it's too far back to find.
             self.pending_jump = None;
 
@@ -326,12 +317,10 @@ impl ChatState {
                             store.application.settings.tunables.open_command.as_ref(),
                             target,
                         ) {
-                            Ok(_) => {
-                                InfoMessage::from(format!(
-                                    "Attachment downloaded to {} and opened",
-                                    filename.display()
-                                ))
-                            },
+                            Ok(_) => InfoMessage::from(format!(
+                                "Attachment downloaded to {} and opened",
+                                filename.display()
+                            )),
                             Err(err) => {
                                 return Err(err);
                             },
@@ -448,12 +437,10 @@ impl ChatState {
                         let msg = "Cannot pin a redacted message";
                         return Err(UIError::Failure(msg.into()));
                     },
-                    event => {
-                        event
-                            .event_id()
-                            .map(ToOwned::to_owned)
-                            .ok_or(IambError::NoSelectedMessage)?
-                    },
+                    event => event
+                        .event_id()
+                        .map(ToOwned::to_owned)
+                        .ok_or(IambError::NoSelectedMessage)?,
                 };
 
                 let room = self.get_joined(&store.application.worker)?;
@@ -560,14 +547,7 @@ impl ChatState {
                     return Err(UIError::Failure(msg.into()));
                 };
 
-                let Some(key) = info.get_message_key(&reply) else {
-                    store.application.need_load.need_message(self.room_id.clone(), reply);
-                    let msg = "Replied to message will be loaded in the background";
-                    return Err(UIError::Failure(msg.into()));
-                };
-
-                self.scrollback.goto_message(key.clone());
-                Ok(None)
+                self.jump_to_message(reply, store)
             },
             MessageAction::Unreact(reaction, literal) => {
                 let emoji = match reaction {
@@ -651,8 +631,8 @@ impl ChatState {
         let thread_last = self.scrollback.thread().and_then(|id| info.get_thread_last(id));
 
         let (event_id, enforce_thread) = if let Some(last) = thread_last {
-            if let Some(m) = self.get_reply_to(info) &&
-                set_reply
+            if let Some(m) = self.get_reply_to(info)
+                && set_reply
             {
                 // thread reply
                 (m.event_id.to_owned(), EnforceThread::Threaded(ReplyWithinThread::Yes))
@@ -660,8 +640,8 @@ impl ChatState {
                 // thread message
                 (last.event_id.to_owned(), EnforceThread::Threaded(ReplyWithinThread::No))
             }
-        } else if let Some(m) = self.get_reply_to(info) &&
-            set_reply
+        } else if let Some(m) = self.get_reply_to(info)
+            && set_reply
         {
             // normal reply in main timeline:
             (m.event_id.to_owned(), EnforceThread::Unthreaded)
@@ -816,8 +796,8 @@ impl ChatState {
             SendAction::Upload(file, add_caption) => {
                 let caption = self.tbox.get();
 
-                if add_caption.is_none() &&
-                    (!caption.is_blank() || self.get_reply_to(info).is_some())
+                if add_caption.is_none()
+                    && (!caption.is_blank() || self.get_reply_to(info).is_some())
                 {
                     let msg = "Would you like to use the message bar as a caption?";
 
@@ -891,8 +871,8 @@ impl ChatState {
         // Jump to the end of the scrollback to show the message.
         self.scrollback.goto_latest();
 
-        if tunables.read_receipt_trigger.on_message() &&
-            let Some(thread) = self.scrollback.get_thread(info)
+        if tunables.read_receipt_trigger.on_message()
+            && let Some(thread) = self.scrollback.get_thread(info)
         {
             info.fully_read(
                 self.room_id.clone(),
@@ -967,7 +947,7 @@ fn open_links(msg: &Message) -> UIError<IambInfo> {
         .into_iter()
         .map(|l| {
             let url = l.1.to_string();
-            let act = IambAction::OpenLink(url.clone(), false).into();
+            let act = IambAction::OpenLink(url.clone()).into();
             MultiChoiceItem::new(l.0, url, vec![act])
         })
         .collect();
@@ -978,15 +958,11 @@ fn open_links(msg: &Message) -> UIError<IambInfo> {
 macro_rules! delegate {
     ($s: expr, $id: ident => $e: expr) => {
         match $s.focus {
-            RoomFocus::Scrollback => {
-                match $s {
-                    ChatState { scrollback: $id, .. } => $e,
-                }
+            RoomFocus::Scrollback => match $s {
+                ChatState { scrollback: $id, .. } => $e,
             },
-            RoomFocus::MessageBar => {
-                match $s {
-                    ChatState { tbox: $id, .. } => $e,
-                }
+            RoomFocus::MessageBar => match $s {
+                ChatState { tbox: $id, .. } => $e,
             },
         }
     };
@@ -1072,9 +1048,9 @@ impl Editable<ProgramContext, ProgramStore, IambInfo> for ChatState {
         match delegate!(self, w => w.editor_command(act, ctx, store)) {
             res @ Ok(_) => res,
             Err(EditError::WrongBuffer(IambBufferId::Room(room_id, thread, focus)))
-                if room_id == self.room_id &&
-                    thread.as_ref() == self.thread() &&
-                    act.is_switchable(ctx) =>
+                if room_id == self.room_id
+                    && thread.as_ref() == self.thread()
+                    && act.is_switchable(ctx) =>
             {
                 // Switch focus.
                 self.focus = focus;
@@ -1257,6 +1233,7 @@ impl StatefulWidget for Chat<'_> {
         state.complete_pending_jump(self.store);
 
         let settings = &self.store.application.settings;
+        let theme = &settings.theme;
 
         // Determine whether we have a description to show for the message bar.
         let desc_spans = match (&state.editing, &state.reply_to, state.thread()) {
@@ -1317,8 +1294,11 @@ impl StatefulWidget for Chat<'_> {
         }
 
         let encryption_settings = &settings.tunables.encryption;
-        let encryption_indicator = encryption_settings
-            .get_indicator(EncryptionIndicatorLocation::PROMPT, state.room().encryption_state());
+        let encryption_indicator = encryption_settings.get_indicator(
+            EncryptionIndicatorLocation::PROMPT,
+            state.room().encryption_state(),
+            theme,
+        );
         let input_prompt = settings.tunables.input_prompt.as_deref();
         let prompt = match (self.focused, encryption_indicator, input_prompt) {
             // User has both encryption indicator and custom prompt, combine them:
@@ -1345,15 +1325,17 @@ impl StatefulWidget for Chat<'_> {
             }
         }
 
-        let tbox = TextBox::new().prompt(prompt);
+        let tbox = TextBox::new().style(theme.msgbar.default).prompt(prompt);
         state
             .tbox
             .set_ignorecase(self.store.application.settings.tunables.ignorecase);
         tbox.render(textarea, buf, &mut state.tbox);
 
         // Render the message scrollback.
+        let scrollback_style = self.store.application.settings.theme.timeline.default;
         let scrollback_focused = state.focus.is_scrollback() && self.focused;
         let scrollback = Scrollback::new(self.store)
+            .style(scrollback_style)
             .focus(scrollback_focused)
             .room_focus(self.focused);
         scrollback.render(scrollarea, buf, &mut state.scrollback);
@@ -1394,7 +1376,7 @@ fn extract_mentions(content: &TextMessageEventContent) -> Mentions {
 }
 
 fn extract_mentions_str(html: &str) -> Mentions {
-    let re = Regex::new(r#"<a href="(https://matrix.to/#/@[^"]*:[^"]*)">"#).unwrap();
+    let re = Regex::new(r#"<a href="(https://matrix.to/#/@[^"]*:[^"]*)"[^>]*>"#).unwrap();
 
     let user_ids = re.captures_iter(html).filter_map(|capture| {
         let link = capture.get(1)?.as_str();
@@ -1509,8 +1491,7 @@ mod tests {
     #[test]
     fn test_location_geo_uri() {
         use matrix_sdk::ruma::events::room::message::{
-            LocationMessageEventContent,
-            TextMessageEventContent,
+            LocationMessageEventContent, TextMessageEventContent,
         };
 
         let location = MessageType::Location(LocationMessageEventContent::new(
@@ -1534,6 +1515,13 @@ mod tests {
         let res =
             mentions_in(r#"<a href="https://matrix.to/#/@user:example.com?via=example.com">u</a>"#);
         assert_eq!(res, vec!["@user:example.com"]);
+    }
+
+    #[test]
+    fn test_extract_mentions_title() {
+        let twim = r#"<a href="https://matrix.to/#/@this-week-in:matrix.org" title="@this-week-in:matrix.org">TWIM</a>"#;
+        let res = mentions_in(twim);
+        assert_eq!(res, vec!["@this-week-in:matrix.org"]);
     }
 
     #[test]

@@ -14,6 +14,7 @@ use matrix_sdk::ruma::events::poll::unstable_start::{
 };
 use matrix_sdk::ruma::events::reaction::ReactionEvent;
 use matrix_sdk::ruma::events::relation::Replacement;
+use matrix_sdk::ruma::events::room::encrypted::Relation as EncryptedRelation;
 use matrix_sdk::ruma::events::room::encrypted::RoomEncryptedEvent;
 use matrix_sdk::ruma::events::room::message::RelationWithoutReplacement;
 use matrix_sdk::ruma::events::room::message::{
@@ -44,11 +45,11 @@ use modalkit::env::vim::command::{CommandContext, VimCommand, VimCommandMachine}
 use modalkit::env::vim::keybindings::VimMachine;
 use modalkit::errors::UIResult;
 use modalkit::keybindings::SequenceStatus;
+use percent_encoding::{NON_ALPHANUMERIC, percent_decode, percent_encode};
 use serde::de::Error as SerdeError;
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::sync::Mutex as AsyncMutex;
-use url::form_urlencoded;
 
 use crate::message::poll::{
     Poll,
@@ -543,6 +544,16 @@ pub enum RoomAction {
     SetUnread(bool),
 }
 
+/// An action that joins  a room.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JoinAction {
+    /// Join the focused room.
+    Join,
+
+    /// Knock on the focused room.
+    Knock,
+}
+
 /// An action that sends a message to a room.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SendAction {
@@ -618,11 +629,14 @@ pub enum IambAction {
     /// Perform an action on the current space.
     Space(SpaceAction),
 
-    /// Open a URL (and specify whether to join linked matrix rooms).
-    OpenLink(String, bool),
+    /// Open a URL.
+    OpenLink(String),
 
     /// Perform an action on the currently focused room.
     Room(RoomAction),
+
+    /// Join the focused room preview.
+    Join(JoinAction),
 
     /// Send a message to the currently focused room.
     Send(SendAction),
@@ -674,6 +688,12 @@ impl From<RoomAction> for IambAction {
     }
 }
 
+impl From<JoinAction> for IambAction {
+    fn from(act: JoinAction) -> Self {
+        IambAction::Join(act)
+    }
+}
+
 impl From<SendAction> for IambAction {
     fn from(act: SendAction) -> Self {
         IambAction::Send(act)
@@ -702,6 +722,7 @@ impl ApplicationAction for IambAction {
             IambAction::Verify(..) => SequenceStatus::Break,
             IambAction::VerifyRequest(..) => SequenceStatus::Break,
             IambAction::Recover(..) => SequenceStatus::Break,
+            IambAction::Join(..) => SequenceStatus::Break,
         }
     }
 
@@ -720,6 +741,7 @@ impl ApplicationAction for IambAction {
             IambAction::Verify(..) => SequenceStatus::Atom,
             IambAction::VerifyRequest(..) => SequenceStatus::Atom,
             IambAction::Recover(..) => SequenceStatus::Atom,
+            IambAction::Join(..) => SequenceStatus::Atom,
         }
     }
 
@@ -738,6 +760,7 @@ impl ApplicationAction for IambAction {
             IambAction::Verify(..) => SequenceStatus::Ignore,
             IambAction::VerifyRequest(..) => SequenceStatus::Ignore,
             IambAction::Recover(..) => SequenceStatus::Ignore,
+            IambAction::Join(..) => SequenceStatus::Ignore,
         }
     }
 
@@ -756,6 +779,7 @@ impl ApplicationAction for IambAction {
             IambAction::Verify(..) => false,
             IambAction::VerifyRequest(..) => false,
             IambAction::Recover(..) => false,
+            IambAction::Join(..) => false,
         }
     }
 }
@@ -949,26 +973,18 @@ impl From<IambError> for UIError<IambInfo> {
     }
 }
 
-impl ApplicationError for IambError {}
-
-/// Status for tracking how much room scrollback we've fetched.
-#[derive(Default)]
-pub enum RoomFetchStatus {
-    /// Room history has been completely fetched.
-    Done,
-
-    /// More room history can be fetched.
-    HaveMore(String),
-
-    /// We have not yet started fetching history for this room.
-    #[default]
-    NotStarted,
+impl From<matrix_sdk::event_cache::EventCacheError> for IambError {
+    fn from(value: matrix_sdk::event_cache::EventCacheError) -> Self {
+        Self::from(matrix_sdk::Error::from(value))
+    }
 }
+
+impl ApplicationError for IambError {}
 
 /// Indicates where an [EventId] lives in the [ChatStore].
 #[derive(Clone)]
 pub enum EventLocation {
-    /// The [EventId] belongs to a message.
+    /// The [EventId] belongs to a message like event.
     ///
     /// If the first argument is [None], then it's part of the main scrollback. When [Some],
     /// it specifies which thread it's in reply to.
@@ -976,9 +992,6 @@ pub enum EventLocation {
 
     /// The [EventId] belongs to a reaction to the given event.
     Reaction(OwnedEventId),
-
-    /// The [EventId] belongs to a state event in the main timeline of the room.
-    State(MessageKey),
 
     /// The [EventId] belongs to an edit for the given event and has key [MessageKey].
     Edit(OwnedEventId, MessageKey),
@@ -1202,8 +1215,8 @@ pub struct RoomInfo {
     /// Whether the scrollback for this room is currently being fetched.
     pub fetching: bool,
 
-    /// Where to continue fetching from when we continue loading scrollback history.
-    pub fetch_id: RoomFetchStatus,
+    /// Whether all messages are loaded.
+    pub reached_timeline_start: bool,
 
     /// The time that we last fetched scrollback for this room.
     pub fetch_last: Option<Instant>,
@@ -1241,7 +1254,7 @@ impl Default for RoomInfo {
             reactions: Default::default(),
             threads: Default::default(),
             fetching: Default::default(),
-            fetch_id: Default::default(),
+            reached_timeline_start: false,
             fetch_last: Default::default(),
             users_typing: Default::default(),
             display_names: Default::default(),
@@ -1355,7 +1368,7 @@ impl RoomInfo {
 
     pub fn get_receipt_thread(&self, event_id: &EventId) -> Option<ReceiptThread> {
         match self.keys.get(event_id)? {
-            EventLocation::Message(None, _) | EventLocation::State(_) => Some(ReceiptThread::Main),
+            EventLocation::Message(None, _) => Some(ReceiptThread::Main),
             EventLocation::Message(Some(root), _) => Some(ReceiptThread::Thread(root.clone())),
             _ => None,
         }
@@ -1459,12 +1472,6 @@ impl RoomInfo {
                     poll.redact(&loc);
                 }
             },
-            Some(EventLocation::State(key)) => {
-                if let Some(msg) = self.messages.get_mut(key) {
-                    let ev = SyncRoomRedactionEvent::Original(ev);
-                    msg.redact(ev);
-                }
-            },
             Some(EventLocation::Message(None, key)) => {
                 if let Some(msg) = self.messages.get_mut(key) {
                     let ev = SyncRoomRedactionEvent::Original(ev);
@@ -1487,6 +1494,24 @@ impl RoomInfo {
                 self.keys.remove(redacts);
             },
         }
+    }
+
+    /// Insert a message with a [`EventLocation::Message`].
+    fn insert_msglike(
+        &mut self,
+        event_id: OwnedEventId,
+        thread_root: Option<OwnedEventId>,
+        message: Message,
+    ) {
+        let sender = message.sender.clone();
+
+        let key = MessageKey { ts: message.timestamp, id: event_id.clone().into() };
+        let loc = EventLocation::Message(thread_root.clone(), key.clone());
+        self.keys.insert(event_id.clone(), loc);
+
+        let thread = self.get_thread_mut(thread_root);
+        thread.insert_message(key, message);
+        self.set_implicit_receipt(sender, event_id);
     }
 
     /// Insert a reaction to a message.
@@ -1515,12 +1540,6 @@ impl RoomInfo {
         previews: &mut PreviewManager,
     ) {
         let event_id = sticker.event_id().to_owned();
-        let sender = sticker.sender().to_owned();
-        let key = MessageKey {
-            ts: sticker.origin_server_ts().into(),
-            id: event_id.clone().into(),
-        };
-
         let thread_root = match &sticker {
             MessageLikeEvent::Original(OriginalMessageLikeEvent {
                 content:
@@ -1543,12 +1562,7 @@ impl RoomInfo {
             previews.register_preview(settings, &source, PreviewKind::Message);
         }
 
-        let loc = EventLocation::Message(thread_root.clone(), key.clone());
-        self.keys.insert(event_id.clone(), loc);
-
-        let thread = self.get_thread_mut(thread_root);
-        thread.insert_message(key, sticker);
-        self.set_implicit_receipt(sender, event_id);
+        self.insert_msglike(event_id, thread_root, sticker.into());
     }
 
     /// Insert a reaction to a message.
@@ -1579,7 +1593,6 @@ impl RoomInfo {
 
     /// Insert the start of a poll.
     pub fn insert_poll_start(&mut self, poll: PollStartEvent) {
-        let sender = poll.sender().to_owned();
         let event_id = poll.event_id().to_owned();
         let key = MessageKey {
             ts: poll.origin_server_ts().into(),
@@ -1622,32 +1635,25 @@ impl RoomInfo {
                         _ => None,
                     };
 
-                    let loc = EventLocation::Message(thread_root.clone(), key.clone());
-                    self.keys.insert(event_id.clone(), loc);
-
                     let unloaded = self.unloaded_polls.remove(&ev.event_id).unwrap_or_default();
                     let msg = MessageEvent::Poll(
                         Poll::new(ev.event_id, ev.sender.to_owned(), ev.content, unloaded).into(),
                     );
                     let msg = Message::new(msg, ev.sender, ev.origin_server_ts.into());
 
-                    self.get_thread_mut(thread_root).insert_message(key, msg);
+                    self.insert_msglike(event_id, thread_root, msg);
                 }
             },
             MessageLikeEvent::Redacted(ev) => {
-                let loc = EventLocation::Message(None, key.clone());
                 let message: Message = ev.into();
-                self.keys.insert(event_id.clone(), loc);
-                self.messages.insert_message(key, message);
+
+                self.insert_msglike(event_id, None, message);
             },
         }
-
-        self.set_implicit_receipt(sender, event_id);
     }
 
     /// Insert the start of a poll.
     pub fn insert_unstable_poll_start(&mut self, poll: UnstablePollStartEvent) {
-        let sender = poll.sender().to_owned();
         let event_id = poll.event_id().to_owned();
         let key = MessageKey {
             ts: poll.origin_server_ts().into(),
@@ -1665,9 +1671,6 @@ impl RoomInfo {
                             _ => None,
                         };
 
-                        let loc = EventLocation::Message(thread_root.clone(), key.clone());
-                        self.keys.insert(event_id.clone(), loc);
-
                         let unloaded =
                             self.unloaded_unstable_polls.remove(&ev.event_id).unwrap_or_default();
                         let msg = MessageEvent::UnstablePoll(
@@ -1676,7 +1679,7 @@ impl RoomInfo {
                         );
                         let msg = Message::new(msg, ev.sender, ev.origin_server_ts.into());
 
-                        self.get_thread_mut(thread_root).insert_message(key, msg);
+                        self.insert_msglike(event_id, thread_root, msg);
                     },
                     UnstablePollStartEventContent::Replacement(content) => {
                         let loc = EventLocation::Poll(
@@ -1706,14 +1709,11 @@ impl RoomInfo {
                 }
             },
             MessageLikeEvent::Redacted(ev) => {
-                let loc = EventLocation::Message(None, key.clone());
                 let message: Message = ev.into();
-                self.keys.insert(event_id.clone(), loc);
-                self.messages.insert_message(key, message);
+
+                self.insert_msglike(event_id, None, message);
             },
         }
-
-        self.set_implicit_receipt(sender, event_id);
     }
 
     /// Insert an event that relates to a poll
@@ -1793,113 +1793,44 @@ impl RoomInfo {
 
     pub fn insert_any_state(&mut self, msg: AnySyncStateEvent) {
         let event_id = msg.event_id().to_owned();
-        let sender = msg.sender().to_owned();
-        let key = MessageKey {
-            ts: msg.origin_server_ts().into(),
-            id: event_id.clone().into(),
-        };
 
-        let loc = EventLocation::State(key.clone());
-        self.keys.insert(event_id.clone(), loc);
-        self.messages.insert_message(key, msg);
-        self.set_implicit_receipt(sender, event_id);
-    }
-
-    /// Indicates whether this room has unread messages.
-    pub fn unreads(&self, room: &matrix_sdk::Room) -> UnreadInfo {
-        let last_message = self
-            .messages
-            .iter()
-            .rev()
-            .find(|(_, msg)| !matches!(&msg.event, MessageEvent::State(..)));
-
-        UnreadInfo {
-            unread_mark: room.is_marked_unread(),
-            unread_messages: room.num_unread_messages(),
-            unread_notifications: room.num_unread_notifications(),
-            unread_mentions: room.num_unread_mentions(),
-            latest: last_message.map(|(key, _)| key.ts.to_owned()),
-        }
+        self.insert_msglike(event_id, None, msg.into());
     }
 
     /// Inserts events that couldn't be decrypted into the scrollback.
     pub fn insert_encrypted(&mut self, msg: RoomEncryptedEvent) {
         let event_id = msg.event_id().to_owned();
-        let sender = msg.sender().to_owned();
-        let key = MessageKey {
-            ts: msg.origin_server_ts().into(),
-            id: event_id.clone().into(),
+
+        let thread_root = if let Some(EncryptedRelation::Thread(Thread { event_id, .. })) =
+            msg.as_original().and_then(|ev| ev.content.relates_to.as_ref())
+        {
+            Some(event_id.to_owned())
+        } else {
+            None
         };
 
-        self.keys
-            .insert(event_id.clone(), EventLocation::Message(None, key.clone()));
-        self.messages.insert(key, msg.into());
-        self.set_implicit_receipt(sender, event_id);
+        self.insert_msglike(event_id, thread_root, msg.into());
     }
 
     /// Insert a new message.
-    pub fn insert_message(&mut self, msg: RoomMessageEvent) {
+    fn insert_message(&mut self, msg: RoomMessageEvent) {
         let event_id = msg.event_id().to_owned();
-        let sender = msg.sender().to_owned();
-        let key = MessageKey {
-            ts: msg.origin_server_ts().into(),
-            id: event_id.clone().into(),
-        };
-
-        let loc = EventLocation::Message(None, key.clone());
-        let mut message: Message = msg.into();
-        if let Some(edits) = self.unloaded_edits.remove(&event_id) {
-            message.set_edits(edits);
-        }
-        self.keys.insert(event_id.clone(), loc);
-        self.messages.insert_message(key, message);
-        self.set_implicit_receipt(sender, event_id);
-    }
-
-    fn insert_thread(&mut self, msg: RoomMessageEvent, thread_root: OwnedEventId) {
-        let event_id = msg.event_id().to_owned();
-        let sender = msg.sender().to_owned();
-        let key = MessageKey {
-            ts: msg.origin_server_ts().into(),
-            id: event_id.clone().into(),
-        };
-
-        let replies = self
-            .threads
-            .entry(thread_root.clone())
-            .or_insert_with(|| Messages::thread(thread_root.clone()));
-        let loc = EventLocation::Message(Some(thread_root), key.clone());
-        let mut message: Message = msg.into();
-        if let Some(edits) = self.unloaded_edits.remove(&event_id) {
-            message.set_edits(edits);
-        }
-        self.keys.insert(event_id.clone(), loc);
-        replies.insert_message(key, message);
-        self.set_implicit_receipt(sender, event_id);
-    }
-
-    /// Insert a new message event.
-    pub fn insert(&mut self, msg: RoomMessageEvent) {
-        match msg {
-            RoomMessageEvent::Original(OriginalRoomMessageEvent {
-                content: RoomMessageEventContent { relates_to: Some(ref relates_to), .. },
-                ..
-            }) => {
-                match relates_to {
-                    Relation::Replacement(repl) => {
-                        let repl = repl.clone();
-                        self.insert_edit(msg, repl)
-                    },
-                    Relation::Thread(Thread { event_id, .. }) => {
-                        let event_id = event_id.clone();
-                        self.insert_thread(msg, event_id);
-                    },
-                    Relation::Reply { .. } => self.insert_message(msg),
-                    _ => self.insert_message(msg),
-                }
+        let thread_root = match msg.as_original().and_then(|ev| ev.content.relates_to.as_ref()) {
+            Some(Relation::Replacement(repl)) => {
+                let repl = repl.to_owned();
+                self.insert_edit(msg, repl);
+                return;
             },
-            _ => self.insert_message(msg),
+            Some(Relation::Thread(Thread { event_id, .. })) => Some(event_id.to_owned()),
+            _ => None,
+        };
+
+        let mut message: Message = msg.into();
+        if let Some(edits) = self.unloaded_edits.remove(&event_id) {
+            message.set_edits(edits);
         }
+
+        self.insert_msglike(event_id, thread_root, message);
     }
 
     /// Insert a new message event, and prepare for image-preview if it has an image attachment.
@@ -1918,7 +1849,24 @@ impl RoomInfo {
             previews.register_preview(settings, &c.source, PreviewKind::Message)
         }
 
-        self.insert(ev);
+        self.insert_message(ev);
+    }
+
+    /// Indicates whether this room has unread messages.
+    pub fn unreads(&self, room: &matrix_sdk::Room) -> UnreadInfo {
+        let last_message = self
+            .messages
+            .iter()
+            .rev()
+            .find(|(_, msg)| !matches!(&msg.event, MessageEvent::State(..)));
+
+        UnreadInfo {
+            unread_mark: room.is_marked_unread(),
+            unread_messages: room.num_unread_messages(),
+            unread_notifications: room.num_unread_notifications(),
+            unread_mentions: room.num_unread_mentions(),
+            latest: last_message.map(|(key, _)| key.ts.to_owned()),
+        }
     }
 
     /// Indicates whether we've recently fetched scrollback for this room.
@@ -1978,7 +1926,7 @@ impl RoomInfo {
 
     fn receipt_key(&self, event_id: &EventId) -> Option<&MessageKey> {
         match self.keys.get(event_id)? {
-            EventLocation::Message(_, key) | EventLocation::State(key) => Some(key),
+            EventLocation::Message(_, key) => Some(key),
             _ => None,
         }
     }
@@ -2277,9 +2225,10 @@ pub struct Need {
 }
 
 /// Things that need loading for different rooms.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct RoomNeeds {
     needs: HashMap<OwnedRoomId, Need>,
+    previews: HashSet<OwnedRoomOrAliasId>,
 }
 
 impl RoomNeeds {
@@ -2315,6 +2264,16 @@ impl RoomNeeds {
             .extend(message_needs);
     }
 
+    /// Request the load of a room preview.
+    pub fn need_preview(&mut self, room: OwnedRoomOrAliasId) {
+        self.previews.insert(room);
+    }
+
+    /// Return all requested room previews
+    pub fn preview_needs(&mut self) -> impl Iterator<Item = OwnedRoomOrAliasId> {
+        std::mem::take(&mut self.previews).into_iter()
+    }
+
     pub fn rooms(&self) -> usize {
         self.needs.len()
     }
@@ -2340,8 +2299,17 @@ pub struct ChatStore {
     /// Map of joined rooms.
     pub rooms: CompletionMap<OwnedRoomId, RoomInfo>,
 
-    /// Map of room names.
-    pub names: CompletionMap<OwnedRoomAliasId, OwnedRoomId>,
+    /// Map of loaded room previews with their fetch time
+    pub room_previews:
+        HashMap<OwnedRoomOrAliasId, (Result<RoomPreview, matrix_sdk::Error>, Instant)>,
+
+    /// Cache of encountered `via` parameters in room links.
+    ///
+    /// This is stored here because this data is lost in the conversion to [IambId].
+    pub room_via: HashMap<OwnedRoomOrAliasId, Vec<OwnedServerName>>,
+
+    /// Map of room aliases.
+    pub aliases: CompletionMap<OwnedRoomAliasId, OwnedRoomId>,
 
     /// Presence information for other users.
     pub presences: CompletionMap<OwnedUserId, PresenceState>,
@@ -2398,8 +2366,10 @@ impl ChatStore {
             emojis: emoji_map(),
 
             collator: Default::default(),
-            names: Default::default(),
+            aliases: Default::default(),
             rooms: Default::default(),
+            room_previews: Default::default(),
+            room_via: Default::default(),
             presences: Default::default(),
             verifications: Default::default(),
             need_load: Default::default(),
@@ -2445,7 +2415,17 @@ impl ChatStore {
     }
 
     /// Set the name and tags for a room.
-    pub fn set_room_info(&mut self, room_id: OwnedRoomId, name: String, tags: Option<Tags>) {
+    pub fn set_room_info(
+        &mut self,
+        room_id: OwnedRoomId,
+        name: String,
+        tags: Option<Tags>,
+        aliases: Vec<OwnedRoomAliasId>,
+    ) {
+        for alias in aliases {
+            self.aliases.insert(alias, room_id.clone());
+        }
+
         let info = self.rooms.get_or_default(room_id);
         info.name = name.into();
         info.tags = tags;
@@ -2458,13 +2438,7 @@ impl ApplicationStore for ChatStore {}
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum IambId {
     /// A Matrix room, with an optional thread to show.
-    Room(OwnedRoomId, Option<OwnedEventId>),
-
-    /// A Matrix room that we're currently in the middle of joining.
-    Joining(String),
-
-    /// A Matrix room that we haven't joined, and aren't currently joining.
-    NotJoined(String),
+    Room(OwnedRoomOrAliasId, Option<OwnedEventId>),
 
     /// The `:dms` window.
     DirectList,
@@ -2500,38 +2474,16 @@ pub enum IambId {
     InvitesList,
 }
 
-/// Encode the room name for a [IambId::Joining] or [IambId::NotJoined] window URL.
-///
-/// Note that since these names come straight from the user's argument to `:join`,
-/// they are likely room aliases containing characters like `#` that we should
-/// escape before putting them into the URL, so we can later reparse it. They can
-/// technically contain anything that the user tried to pass to `:join`.
-fn room_query(room: &str) -> String {
-    form_urlencoded::Serializer::new(String::new())
-        .append_pair("room", room)
-        .finish()
-}
-
-/// Pull the room name back out of the query parameter for `iamb://joining` or
-/// `iamb://not-joined`.
-fn query_room(url: &Url) -> Option<String> {
-    url.query_pairs().find_map(|(k, v)| (k == "room").then(|| v.into_owned()))
-}
-
 impl Display for IambId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IambId::Room(room_id, None) => {
-                write!(f, "iamb://room/{room_id}")
+            IambId::Room(alias, None) => {
+                let encoded = percent_encode(alias.as_bytes(), NON_ALPHANUMERIC);
+                write!(f, "iamb://room/{}", encoded)
             },
-            IambId::Room(room_id, Some(thread)) => {
-                write!(f, "iamb://room/{room_id}/threads/{thread}")
-            },
-            IambId::Joining(room) => {
-                write!(f, "iamb://joining?{}", room_query(room))
-            },
-            IambId::NotJoined(room) => {
-                write!(f, "iamb://not-joined?{}", room_query(room))
+            IambId::Room(alias, Some(thread)) => {
+                let encoded = percent_encode(alias.as_bytes(), NON_ALPHANUMERIC);
+                write!(f, "iamb://room/{}/threads/{thread}", encoded)
             },
             IambId::MemberList(room_id) => {
                 write!(f, "iamb://members/{room_id}")
@@ -2601,16 +2553,18 @@ impl Visitor<'_> for IambIdVisitor {
                 };
 
                 match *path.collect::<Vec<_>>().as_slice() {
-                    [room_id] => {
-                        let Ok(room_id) = OwnedRoomId::try_from(room_id) else {
-                            return Err(E::custom("Invalid room identifier"));
+                    [alias] => {
+                        let decoded = percent_decode(alias.as_bytes()).decode_utf8_lossy();
+                        let Ok(room_id) = OwnedRoomOrAliasId::try_from(decoded.as_ref()) else {
+                            return Err(E::custom(format!("Invalid room identifier: {decoded:?}")));
                         };
 
                         Ok(IambId::Room(room_id, None))
                     },
-                    [room_id, "threads", thread_root] => {
-                        let Ok(room_id) = OwnedRoomId::try_from(room_id) else {
-                            return Err(E::custom("Invalid room identifier"));
+                    [alias, "threads", thread_root] => {
+                        let decoded = percent_decode(alias.as_bytes()).decode_utf8_lossy();
+                        let Ok(room_id) = OwnedRoomOrAliasId::try_from(decoded.as_ref()) else {
+                            return Err(E::custom("Invalid room identifier: {decoded:?}"));
                         };
 
                         let Ok(thread_root) = OwnedEventId::try_from(thread_root) else {
@@ -2628,20 +2582,6 @@ impl Visitor<'_> for IambIdVisitor {
                     },
                     _ => return Err(E::custom("Invalid iamb window URL")),
                 }
-            },
-            Some("joining") => {
-                let Some(room) = query_room(&url) else {
-                    return Err(E::custom("iamb://joining requires a room parameter"));
-                };
-
-                Ok(IambId::Joining(room))
-            },
-            Some("not-joined") => {
-                let Some(room) = query_room(&url) else {
-                    return Err(E::custom("iamb://not-joined requires a room parameter"));
-                };
-
-                Ok(IambId::NotJoined(room))
             },
             Some("members") => {
                 let Some(path) = url.path_segments() else {
@@ -2807,7 +2747,9 @@ impl IambBufferId {
     pub fn to_window(&self) -> Option<IambId> {
         let id = match self {
             IambBufferId::Command(_) => return None,
-            IambBufferId::Room(room, thread, _) => IambId::Room(room.clone(), thread.clone()),
+            IambBufferId::Room(room, thread, _) => {
+                IambId::Room(room.clone().into(), thread.clone())
+            },
             IambBufferId::DirectList => IambId::DirectList,
             IambBufferId::MemberList(room) => IambId::MemberList(room.clone()),
             IambBufferId::PinnedList(room) => IambId::PinnedList(room.clone()),
@@ -2852,7 +2794,6 @@ pub mod tests {
     use ratatui::style::Color;
     use serde_json::{Map, Value};
 
-    use crate::config::user_style_from_color;
     use crate::tests::*;
 
     fn mock_room_message_event(
@@ -3003,7 +2944,8 @@ pub mod tests {
     #[test]
     fn test_implicit_receipt_supports_state_events() {
         let mut info = RoomInfo::default();
-        info.keys.insert(MSG5_EVID.clone(), EventLocation::State(MSG5_KEY.clone()));
+        info.keys
+            .insert(MSG5_EVID.clone(), EventLocation::Message(None, MSG5_KEY.clone()));
 
         info.set_implicit_receipt(TEST_USER2.clone(), MSG5_EVID.clone());
 
@@ -3065,6 +3007,7 @@ pub mod tests {
     fn test_typing_spans() {
         let mut info = RoomInfo::default();
         let settings = mock_settings();
+        let theme = &settings.theme;
 
         let users0 = vec![];
         let users1 = vec![TEST_USER1.clone()];
@@ -3098,7 +3041,7 @@ pub mod tests {
         assert_eq!(
             info.get_typing_spans(&settings),
             Line::from(vec![
-                Span::styled("@user1:example.com", user_style("@user1:example.com")),
+                Span::styled("@user1:example.com", theme.users.style("@user1:example.com", None)),
                 Span::from(" is typing...")
             ])
         );
@@ -3109,9 +3052,9 @@ pub mod tests {
         assert_eq!(
             info.get_typing_spans(&settings),
             Line::from(vec![
-                Span::styled("@user1:example.com", user_style("@user1:example.com")),
+                Span::styled("@user1:example.com", theme.users.style("@user1:example.com", None)),
                 Span::raw(" and "),
-                Span::styled("@user2:example.com", user_style("@user2:example.com")),
+                Span::styled("@user2:example.com", theme.users.style("@user2:example.com", None)),
                 Span::raw(" are typing...")
             ])
         );
@@ -3132,39 +3075,10 @@ pub mod tests {
         assert_eq!(
             info.get_typing_spans(&settings),
             Line::from(vec![
-                Span::styled("USER 5", user_style_from_color(Color::Black)),
+                Span::styled("USER 5", Style::default().fg(Color::Black).bold()),
                 Span::from(" is typing...")
             ])
         );
-    }
-
-    #[test]
-    fn test_unjoined_window_ids() {
-        // Room names come from the user can contain characters that need escaping:
-        for name in [
-            "#foo:example.com",
-            "!abc123:example.com",
-            "@user:example.com",
-            "a b&c=d?e#f",
-        ] {
-            for id in [IambId::Joining(name.into()), IambId::NotJoined(name.into())] {
-                let json = serde_json::to_string(&id).unwrap();
-                assert_eq!(serde_json::from_str::<IambId>(&json).unwrap(), id);
-            }
-        }
-
-        assert_eq!(
-            IambId::Joining("#foo:example.com".into()).to_string(),
-            "iamb://joining?room=%23foo%3Aexample.com"
-        );
-        assert_eq!(
-            IambId::NotJoined("#foo:example.com".into()).to_string(),
-            "iamb://not-joined?room=%23foo%3Aexample.com"
-        );
-
-        // A window URL without a room name isn't valid and wasn't written by us:
-        assert!(serde_json::from_str::<IambId>("\"iamb://joining\"").is_err());
-        assert!(serde_json::from_str::<IambId>("\"iamb://not-joined\"").is_err());
     }
 
     #[test]
@@ -3222,6 +3136,20 @@ pub mod tests {
         assert_eq!(thread, None);
         assert_eq!(key, &*MSG3_KEY);
         assert!(info.get_message_location(&unloaded).is_none());
+    }
+
+    #[test]
+    fn test_alias_window_id() {
+        let room_id = TEST_ROOM1_ALIAS.clone();
+        let id = IambId::Room(room_id.into(), None);
+
+        // Hash gets replaced during encoding:
+        let exp = "iamb://room/%23room1%3Aexample%2Ecom";
+        assert_eq!(id.to_string(), exp);
+
+        // Percent encoding turns back into hash during decoding:
+        let parsed: IambId = serde_json::from_str(&format!("{exp:?}")).unwrap();
+        assert_eq!(parsed, id);
     }
 
     #[test]

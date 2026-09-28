@@ -13,7 +13,7 @@ use std::fmt::{self};
 use feruca::Collator;
 use matrix_sdk::room::RoomMember;
 use matrix_sdk::ruma::events::room::member::MembershipState;
-use matrix_sdk::ruma::{RoomAliasId, assign};
+use matrix_sdk::ruma::{RoomAliasId, RoomOrAliasId, assign};
 use modalkit::editing::completion::CompletionMap;
 use modalkit_ratatui::Window;
 use modalkit_ratatui::list::{List, ListCursor, ListItem, ListState};
@@ -32,26 +32,11 @@ pub mod welcome;
 const MEMBER_FETCH_DEBOUNCE: Duration = Duration::from_secs(5);
 
 #[inline]
-fn bold_style() -> Style {
-    Style::default().add_modifier(StyleModifier::BOLD)
-}
-
-#[inline]
-fn bold_span(s: &str) -> Span<'_> {
-    Span::styled(s, bold_style())
-}
-
-#[inline]
-fn bold_spans(s: &str) -> Line<'_> {
-    bold_span(s).into()
-}
-
-#[inline]
-pub fn selected_style(selected: bool) -> Style {
+pub fn selected_style(selected: bool, style: Style) -> Style {
     if selected {
-        Style::default().add_modifier(StyleModifier::REVERSED)
+        style.add_modifier(StyleModifier::REVERSED)
     } else {
-        Style::default()
+        style
     }
 }
 
@@ -67,7 +52,8 @@ fn name_and_labels<'a>(
     name: &'a str,
     unread: &UnreadInfo,
     room_membership: MatrixRoomState,
-    style: Style,
+    name_style: Style,
+    tags_style: Style,
     colors: &ListColorValues,
 ) -> (Span<'a>, Vec<Vec<Span<'static>>>) {
     let unread_color = if unread.has_mention() {
@@ -78,7 +64,7 @@ fn name_and_labels<'a>(
         None
     };
 
-    let mut name_style = style;
+    let mut name_style = name_style;
     if unread.is_unread() {
         name_style = name_style.add_modifier(StyleModifier::BOLD);
     }
@@ -90,19 +76,19 @@ fn name_and_labels<'a>(
 
     match room_membership {
         MatrixRoomState::Joined => {},
-        MatrixRoomState::Left => labels.push(vec![Span::styled("Left", style)]),
-        MatrixRoomState::Banned => labels.push(vec![Span::styled("Banned", style)]),
-        MatrixRoomState::Knocked => labels.push(vec![Span::styled("Knocked", style)]),
-        MatrixRoomState::Invited => labels.push(vec![Span::styled("Invited", style)]),
+        MatrixRoomState::Left => labels.push(vec![Span::styled("Left", tags_style)]),
+        MatrixRoomState::Banned => labels.push(vec![Span::styled("Banned", tags_style)]),
+        MatrixRoomState::Knocked => labels.push(vec![Span::styled("Knocked", tags_style)]),
+        MatrixRoomState::Invited => labels.push(vec![Span::styled("Invited", tags_style)]),
     }
 
     if unread.has_mention() {
         labels.push(vec![Span::styled(
             "Unread Mention",
-            with_fg(style, colors.mention),
+            with_fg(tags_style, colors.mention),
         )]);
     } else if unread.is_unread() {
-        labels.push(vec![Span::styled("Unread", with_fg(style, colors.unread))]);
+        labels.push(vec![Span::styled("Unread", with_fg(tags_style, colors.unread))]);
     }
 
     (name, labels)
@@ -283,7 +269,7 @@ fn room_prompt(
 ) -> EditResult<Vec<(ProgramAction, ProgramContext)>, IambInfo> {
     match act {
         PromptAction::Submit => {
-            let room = IambId::Room(room_id.to_owned(), None);
+            let room = IambId::Room(room_id.to_owned().into(), None);
             let open = WindowAction::Switch(OpenTarget::Application(room));
             let acts = vec![(open.into(), ctx.clone())];
 
@@ -393,7 +379,7 @@ impl IambWindow {
         store: &mut ProgramStore,
     ) -> IambResult<Vec<(Action<IambInfo>, ProgramContext)>> {
         let id = match self {
-            IambWindow::Room(state) => state.id(),
+            IambWindow::Room(state) => state.id(store),
             IambWindow::MemberList(_, room_id, _) => Some(&**room_id),
             IambWindow::PinnedList(_, room_id, _) => Some(&**room_id),
 
@@ -414,6 +400,19 @@ impl IambWindow {
         }
     }
 
+    pub async fn join_command(
+        &mut self,
+        act: JoinAction,
+        ctx: ProgramContext,
+        store: &mut ProgramStore,
+    ) -> IambResult<Vec<(Action<IambInfo>, ProgramContext)>> {
+        if let IambWindow::Room(w) = self {
+            w.join_command(act, ctx, store).await
+        } else {
+            return Err(IambError::NoSelectedRoom.into());
+        }
+    }
+
     pub async fn send_command(
         &mut self,
         act: SendAction,
@@ -429,8 +428,11 @@ impl IambWindow {
 }
 
 pub type MemberListState = ListState<MemberItem, IambInfo>;
+
 pub type PinnedListState = ListState<PinnedItem, IambInfo>;
+
 pub type RoomListState = ListState<GenericRoomItem, IambInfo>;
+
 pub type VerifyListState = ListState<VerifyItem, IambInfo>;
 
 impl From<RoomState> for IambWindow {
@@ -510,7 +512,7 @@ impl WindowOps<IambInfo> for IambWindow {
     fn draw(&mut self, area: Rect, buf: &mut Buffer, focused: bool, store: &mut ProgramStore) {
         let ChatStore {
             collator,
-            names,
+            aliases,
             rooms,
             settings,
             sync_info,
@@ -519,13 +521,16 @@ impl WindowOps<IambInfo> for IambWindow {
             ..
         } = &mut store.application;
 
+        let default_list_style = settings.theme.default;
+        let default_rooms_style = settings.theme.rooms.default;
+
         match self {
             IambWindow::Room(state) => state.draw(area, buf, focused, store),
             IambWindow::DirectList(state) => {
                 let mut items = sync_info
                     .dms
                     .iter()
-                    .map(|room| GenericRoomItem::new_unspecified(room, rooms, names))
+                    .map(|room| GenericRoomItem::new_unspecified(room, rooms, aliases))
                     .collect::<Vec<_>>();
                 let fields = &settings.tunables.sort.dms;
                 items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
@@ -537,6 +542,7 @@ impl WindowOps<IambInfo> for IambWindow {
                     .empty_message("No direct messages yet!")
                     .empty_alignment(Alignment::Center)
                     .focus(focused)
+                    .style(default_rooms_style)
                     .render(area, buf, state);
             },
             IambWindow::MemberList(state, room_id, last_fetch) => {
@@ -562,6 +568,7 @@ impl WindowOps<IambInfo> for IambWindow {
                     .empty_message("No users here yet!")
                     .empty_alignment(Alignment::Center)
                     .focus(focused)
+                    .style(default_list_style)
                     .render(area, buf, state);
             },
             IambWindow::PinnedList(state, room_id, last_fetch) => {
@@ -589,13 +596,14 @@ impl WindowOps<IambInfo> for IambWindow {
                     .empty_message("No pinned messages in this room")
                     .empty_alignment(Alignment::Center)
                     .focus(focused)
+                    .style(default_list_style)
                     .render(area, buf, state);
             },
             IambWindow::RoomList(state) => {
                 let mut items = sync_info
                     .rooms
                     .iter()
-                    .map(|room| GenericRoomItem::new_unspecified(room, rooms, names))
+                    .map(|room| GenericRoomItem::new_unspecified(room, rooms, aliases))
                     .collect::<Vec<_>>();
                 let fields = &settings.tunables.sort.rooms;
                 items.sort_by(|a, b| room_fields_cmp(a, b, fields, collator));
@@ -607,6 +615,7 @@ impl WindowOps<IambInfo> for IambWindow {
                     .empty_message("You haven't joined any rooms yet")
                     .empty_alignment(Alignment::Center)
                     .focus(focused)
+                    .style(default_rooms_style)
                     .render(area, buf, state);
             },
             IambWindow::ChatList(state) => {
@@ -614,7 +623,7 @@ impl WindowOps<IambInfo> for IambWindow {
                     .rooms
                     .iter()
                     .chain(sync_info.dms.iter())
-                    .map(|room| GenericRoomItem::new(room, rooms, names))
+                    .map(|room| GenericRoomItem::new(room, rooms, aliases))
                     .collect::<Vec<_>>();
 
                 let fields = &settings.tunables.sort.chats;
@@ -627,6 +636,7 @@ impl WindowOps<IambInfo> for IambWindow {
                     .empty_message("You do not have rooms or dms yet")
                     .empty_alignment(Alignment::Center)
                     .focus(focused)
+                    .style(default_rooms_style)
                     .render(area, buf, state);
             },
             IambWindow::UnreadList(state) => {
@@ -634,7 +644,7 @@ impl WindowOps<IambInfo> for IambWindow {
                     .rooms
                     .iter()
                     .chain(sync_info.dms.iter())
-                    .map(|room| GenericRoomItem::new(room, rooms, names))
+                    .map(|room| GenericRoomItem::new(room, rooms, aliases))
                     .filter(RoomLikeItem::is_unread)
                     .collect::<Vec<_>>();
 
@@ -648,6 +658,7 @@ impl WindowOps<IambInfo> for IambWindow {
                     .empty_message("You do not have any unreads yet")
                     .empty_alignment(Alignment::Center)
                     .focus(focused)
+                    .style(default_rooms_style)
                     .render(area, buf, state);
             },
             IambWindow::MentionsList(state) => {
@@ -655,7 +666,7 @@ impl WindowOps<IambInfo> for IambWindow {
                     .rooms
                     .iter()
                     .chain(sync_info.dms.iter())
-                    .map(|room| GenericRoomItem::new(room, rooms, names))
+                    .map(|room| GenericRoomItem::new(room, rooms, aliases))
                     .filter(RoomLikeItem::has_mention)
                     .collect::<Vec<_>>();
 
@@ -669,6 +680,7 @@ impl WindowOps<IambInfo> for IambWindow {
                     .empty_message("You do not have any unread mentions yet")
                     .empty_alignment(Alignment::Center)
                     .focus(focused)
+                    .style(default_rooms_style)
                     .render(area, buf, state);
             },
             IambWindow::InvitesList(state) => {
@@ -676,7 +688,7 @@ impl WindowOps<IambInfo> for IambWindow {
                     .rooms
                     .iter()
                     .chain(sync_info.dms.iter())
-                    .map(|room| GenericRoomItem::new(room, rooms, names))
+                    .map(|room| GenericRoomItem::new(room, rooms, aliases))
                     .filter(RoomLikeItem::is_invite)
                     .collect::<Vec<_>>();
 
@@ -690,13 +702,14 @@ impl WindowOps<IambInfo> for IambWindow {
                     .empty_message("You do not have any open invites")
                     .empty_alignment(Alignment::Center)
                     .focus(focused)
+                    .style(default_rooms_style)
                     .render(area, buf, state);
             },
             IambWindow::SpaceList(state) => {
                 let mut items = sync_info
                     .spaces
                     .iter()
-                    .map(|room| GenericRoomItem::new_unspecified(room, rooms, names))
+                    .map(|room| GenericRoomItem::new_unspecified(room, rooms, aliases))
                     .collect::<Vec<_>>();
 
                 let fields = &settings.tunables.sort.spaces;
@@ -709,6 +722,7 @@ impl WindowOps<IambInfo> for IambWindow {
                     .empty_message("You haven't joined any spaces yet")
                     .empty_alignment(Alignment::Center)
                     .focus(focused)
+                    .style(default_rooms_style)
                     .render(area, buf, state);
             },
             IambWindow::VerifyList(state) => {
@@ -731,6 +745,7 @@ impl WindowOps<IambInfo> for IambWindow {
                     .empty_message("No in-progress verifications")
                     .empty_alignment(Alignment::Center)
                     .focus(focused)
+                    .style(default_list_style)
                     .render(area, buf, state);
             },
             IambWindow::Welcome(state) => state.draw(area, buf, focused, store),
@@ -804,23 +819,23 @@ impl Window<IambInfo> for IambWindow {
 
     fn get_tab_title(&self, store: &mut ProgramStore) -> Line<'_> {
         match self {
-            IambWindow::DirectList(_) => bold_spans("Direct Messages"),
-            IambWindow::RoomList(_) => bold_spans("Rooms"),
-            IambWindow::SpaceList(_) => bold_spans("Spaces"),
-            IambWindow::VerifyList(_) => bold_spans("Verifications"),
-            IambWindow::Welcome(_) => bold_spans("Welcome to iamb"),
-            IambWindow::ChatList(_) => bold_spans("DMs & Rooms"),
-            IambWindow::UnreadList(_) => bold_spans("Unread Messages"),
-            IambWindow::MentionsList(_) => bold_spans("Unread Mentions"),
-            IambWindow::InvitesList(_) => bold_spans("Open Invites"),
+            IambWindow::DirectList(_) => Line::from("Direct Messages"),
+            IambWindow::RoomList(_) => Line::from("Rooms"),
+            IambWindow::SpaceList(_) => Line::from("Spaces"),
+            IambWindow::VerifyList(_) => Line::from("Verifications"),
+            IambWindow::Welcome(_) => Line::from("Welcome to iamb"),
+            IambWindow::ChatList(_) => Line::from("DMs & Rooms"),
+            IambWindow::UnreadList(_) => Line::from("Unread Messages"),
+            IambWindow::MentionsList(_) => Line::from("Unread Mentions"),
+            IambWindow::InvitesList(_) => Line::from("Open Invites"),
 
             IambWindow::Room(w) => w.get_tab_title(store),
             IambWindow::MemberList(state, room_id, _) => {
                 let title = store.application.get_room_title(room_id.as_ref());
                 let n = state.len();
                 let v = vec![
-                    bold_span("Room Members "),
-                    Span::styled(format!("({n}): "), bold_style()),
+                    Span::raw("Room Members "),
+                    Span::raw(format!("({n}): ")),
                     title.into(),
                 ];
                 Line::from(v)
@@ -829,9 +844,9 @@ impl Window<IambInfo> for IambWindow {
                 let title = store.application.get_room_title(room_id.as_ref());
                 let n = state.len();
                 let v = vec![
-                    bold_span("Pinned Messages "),
-                    Span::styled(format!("({n}): "), bold_style()),
-                    title.into(),
+                    Span::raw("Pinned Messages "),
+                    Span::raw(format!("({n}): ")),
+                    Span::raw(title),
                 ];
                 Line::from(v)
             },
@@ -839,25 +854,28 @@ impl Window<IambInfo> for IambWindow {
     }
 
     fn get_win_title(&self, store: &mut ProgramStore) -> Line<'_> {
+        let style = store.application.settings.theme.windows.title;
+        let default_style = store.application.settings.theme.windows.default;
+
         match self {
-            IambWindow::DirectList(_) => bold_spans("Direct Messages"),
-            IambWindow::RoomList(_) => bold_spans("Rooms"),
-            IambWindow::SpaceList(_) => bold_spans("Spaces"),
-            IambWindow::VerifyList(_) => bold_spans("Verifications"),
-            IambWindow::Welcome(_) => bold_spans("Welcome to iamb"),
-            IambWindow::ChatList(_) => bold_spans("DMs & Rooms"),
-            IambWindow::UnreadList(_) => bold_spans("Unread Messages"),
-            IambWindow::MentionsList(_) => bold_spans("Unread Mentions"),
-            IambWindow::InvitesList(_) => bold_spans("Open Invites"),
+            IambWindow::DirectList(_) => Line::styled("Direct Messages", style),
+            IambWindow::RoomList(_) => Line::styled("Rooms", style),
+            IambWindow::SpaceList(_) => Line::styled("Spaces", style),
+            IambWindow::VerifyList(_) => Line::styled("Verifications", style),
+            IambWindow::Welcome(_) => Line::styled("Welcome to iamb", style),
+            IambWindow::ChatList(_) => Line::styled("DMs & Rooms", style),
+            IambWindow::UnreadList(_) => Line::styled("Unread Messages", style),
+            IambWindow::MentionsList(_) => Line::styled("Unread Mentions", style),
+            IambWindow::InvitesList(_) => Line::styled("Open Invites", style),
 
             IambWindow::Room(w) => w.get_title(store),
             IambWindow::MemberList(state, room_id, _) => {
                 let title = store.application.get_room_title(room_id.as_ref());
                 let n = state.len();
                 let v = vec![
-                    bold_span("Room Members "),
-                    Span::styled(format!("({n}): "), bold_style()),
-                    title.into(),
+                    Span::styled("Room Members ", style),
+                    Span::styled(format!("({n}): "), style),
+                    Span::styled(title, default_style),
                 ];
                 Line::from(v)
             },
@@ -865,9 +883,9 @@ impl Window<IambInfo> for IambWindow {
                 let title = store.application.get_room_title(room_id.as_ref());
                 let n = state.len();
                 let v = vec![
-                    bold_span("Pinned Messages "),
-                    Span::styled(format!("({n}): "), bold_style()),
-                    title.into(),
+                    Span::styled("Pinned Messages ", style),
+                    Span::styled(format!("({n}): "), style),
+                    Span::styled(title, default_style),
                 ];
                 Line::from(v)
             },
@@ -876,21 +894,28 @@ impl Window<IambInfo> for IambWindow {
 
     fn open(id: IambId, store: &mut ProgramStore) -> IambResult<Self> {
         match id {
-            IambId::Room(room_id, thread) => {
-                let (room, name, tags) = store.application.worker.get_room(room_id)?;
-                let room = RoomState::new(room, thread, name, tags, store);
+            IambId::Room(alias_id, thread) => {
+                let alias: &RoomOrAliasId = &alias_id;
+                let room_id = match <&RoomId>::try_from(alias) {
+                    Ok(room_id) => room_id,
+                    Err(alias) => {
+                        if let Some(room_id) = store.application.aliases.get(alias) {
+                            room_id
+                        } else {
+                            return Ok(RoomState::not_joined(alias_id, store).into());
+                        }
+                    },
+                };
 
-                if let Some(room_id) = room.id() {
+                if let Some(room) = store.application.worker.client.get_room(room_id) {
                     store.application.need_load.need_members(room_id.to_owned());
+
+                    let room = RoomState::new(room, thread, store);
+
+                    return Ok(room.into());
                 }
 
-                return Ok(room.into());
-            },
-            IambId::Joining(name) => {
-                return Ok(RoomState::join(name, store).into());
-            },
-            IambId::NotJoined(name) => {
-                return Ok(RoomState::not_joined(name).into());
+                return Ok(RoomState::not_joined(alias_id, store).into());
             },
             IambId::DirectList => {
                 let list = RoomListState::new(IambBufferId::DirectList, vec![]);
@@ -955,13 +980,28 @@ impl Window<IambInfo> for IambWindow {
     }
 
     fn find(name: String, store: &mut ProgramStore) -> IambResult<Self> {
-        if let Some(room) = store.application.names.get(&name) {
-            let id = IambId::Room(room.clone(), None);
-            IambWindow::open(id, store)
+        let room_alias = if let Ok(alias) = <&RoomAliasId>::try_from(name.as_str()) {
+            if let Some(room_id) = store.application.aliases.get(alias) {
+                room_id.to_owned().into()
+            } else {
+                alias.to_owned().into()
+            }
+        } else if let Ok(room_id) = <&RoomId>::try_from(name.as_str()) {
+            room_id.to_owned().into()
+        } else if let Ok(user_id) = <&UserId>::try_from(name.as_str()) {
+            if let Some(dm) = store.application.worker.client.get_dm_room(user_id) {
+                dm.room_id().to_owned().into()
+            } else {
+                store.application.worker.create_dm(user_id.to_owned())?.into()
+            }
         } else {
-            let room = RoomState::join(name, store);
-            Ok(room.into())
-        }
+            // XXX: support passing matrix uris to `:join`
+
+            return Err(UIError::Failure("Could not parse room identifier".to_string()));
+        };
+
+        let id = IambId::Room(room_alias, None);
+        IambWindow::open(id, store)
     }
 
     fn posn(index: usize, _: &mut ProgramStore) -> IambResult<Self> {
@@ -985,17 +1025,6 @@ enum RoomType {
 
     /// Don't show a tag
     Unspecified,
-}
-
-impl RoomType {
-    fn text(self) -> Option<&'static str> {
-        match self {
-            RoomType::DM => Some("DM"),
-            RoomType::Room => Some("Room"),
-            RoomType::Space => Some("Space"),
-            RoomType::Unspecified => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1100,29 +1129,46 @@ impl Display for GenericRoomItem {
 }
 
 impl ListItem<IambInfo> for GenericRoomItem {
+    type Section = &'static str;
+
     fn show(
         &self,
         selected: bool,
         _: &ViewportContext<ListCursor>,
         store: &mut ProgramStore,
     ) -> Text<'_> {
-        let style = selected_style(selected);
+        let theme = &store.application.settings.theme;
         let colors = store.application.settings.tunables.list_colors;
-        let (name, mut labels) =
-            name_and_labels(&self.name, &self.unread, self.membership, style, &colors);
+
+        let name_style = if self.unread.is_unread() {
+            theme.rooms.unread
+        } else {
+            theme.rooms.default
+        };
+
+        let name_style = selected_style(selected, name_style);
+        let tags_style = selected_style(selected, theme.rooms.labels);
+        let (name, mut labels) = name_and_labels(
+            &self.name,
+            &self.unread,
+            self.membership,
+            name_style,
+            tags_style,
+            &colors,
+        );
         let mut spans = vec![name];
 
         match self.room_type {
-            RoomType::DM => labels.push(vec![Span::styled("DM", with_fg(style, colors.dm))]),
-            RoomType::Space => labels.push(vec![Span::styled("Space", style)]),
+            RoomType::DM => labels.push(vec![Span::styled("DM", with_fg(tags_style, colors.dm))]),
+            RoomType::Space => labels.push(vec![Span::styled("Space", tags_style)]),
             RoomType::Room | RoomType::Unspecified => {},
         }
 
         if let Some(tags) = &self.tags {
-            labels.extend(tags.keys().map(|t| tag_to_span(t, style)));
+            labels.extend(tags.keys().map(|t| tag_to_span(t, tags_style)));
         }
 
-        append_tags(labels, &mut spans, style);
+        append_tags(labels, &mut spans, tags_style);
         Text::from(Line::from(spans))
     }
 
@@ -1170,6 +1216,8 @@ impl Display for MemberItem {
 }
 
 impl ListItem<IambInfo> for MemberItem {
+    type Section = &'static str;
+
     fn show(
         &self,
         selected: bool,
@@ -1181,17 +1229,21 @@ impl ListItem<IambInfo> for MemberItem {
         let info = store.application.rooms.get_or_default(self.room_id.clone());
         let user_id = self.member.user_id();
 
+        let theme = &store.application.settings.theme;
+
         let (color, name) = store.application.settings.get_user_overrides(self.member.user_id());
-        let color = color.unwrap_or_else(|| super::config::user_color(user_id.as_str()));
+        let user_style = theme.users.style(user_id.as_str(), color);
+        let color = user_style.fg.unwrap_or(Color::Reset);
 
         let style = if selected {
-            // Ensure the whole item has the same color when it's selected:
-            Style::default().fg(color).add_modifier(StyleModifier::REVERSED)
+            // Ensure the whole item has the same color as `user_style` when it's selected:
+            theme.default.fg(color).add_modifier(StyleModifier::REVERSED)
         } else {
-            Style::default()
+            theme.default
         };
-        let user_style = style.patch(super::config::user_style_from_color(color));
+
         let role_style = style.add_modifier(StyleModifier::BOLD);
+        let user_style = style.patch(user_style);
 
         let mut spans = vec![];
         let mut tags = vec![];
@@ -1213,16 +1265,14 @@ impl ListItem<IambInfo> for MemberItem {
                     Span::styled("Creator", role_style),
                 ]
             },
-            UserPowerLevel::Int(n) => {
-                match i64::from(n) {
-                    0 => vec![],
-                    50 => vec![Span::styled("Moderator", role_style)],
-                    100 => vec![Span::styled("Admin", role_style)],
-                    _ => {
-                        let custom = format!("Power Level {n}");
-                        vec![Span::styled(custom, role_style)]
-                    },
-                }
+            UserPowerLevel::Int(n) => match i64::from(n) {
+                0 => vec![],
+                50 => vec![Span::styled("Moderator", role_style)],
+                100 => vec![Span::styled("Admin", role_style)],
+                _ => {
+                    let custom = format!("Power Level {n}");
+                    vec![Span::styled(custom, role_style)]
+                },
             },
             _ => vec![],
         };
@@ -1306,6 +1356,8 @@ impl Display for PinnedItem {
 }
 
 impl ListItem<IambInfo> for PinnedItem {
+    type Section = &'static str;
+
     fn show(
         &self,
         selected: bool,
@@ -1315,10 +1367,11 @@ impl ListItem<IambInfo> for PinnedItem {
         let info = store.application.rooms.get_or_default(self.room_id.clone());
         let settings = &store.application.settings;
 
+        let style = store.application.settings.theme.default;
         let style = if selected {
-            Style::default().add_modifier(StyleModifier::REVERSED)
+            style.add_modifier(StyleModifier::REVERSED)
         } else {
-            Style::default()
+            style
         };
 
         let Some(msg) = info.get_pinned(&self.event_id) else {
@@ -1359,7 +1412,7 @@ impl Promptable<ProgramContext, ProgramStore, IambInfo> for PinnedItem {
                     .and_then(|(thread, _)| thread)
                     .map(ToOwned::to_owned);
 
-                let room = IambId::Room(self.room_id.clone(), thread);
+                let room = IambId::Room(self.room_id.clone().into(), thread);
                 let open = WindowAction::Switch(OpenTarget::Application(room));
                 let jump = IambAction::from(TimelineAction::GotoEvent(self.event_id.clone()));
 
@@ -1729,6 +1782,7 @@ mod tests {
             &unread_info(0, 0),
             MatrixRoomState::Joined,
             Style::default(),
+            Style::default(),
             &colors,
         );
         assert_eq!(name, Span::raw("hello"));
@@ -1741,6 +1795,7 @@ mod tests {
             "hello",
             &unread_info(0, 0),
             MatrixRoomState::Left,
+            Style::default(),
             Style::default(),
             &ListColorValues::default(),
         );
@@ -1756,8 +1811,14 @@ mod tests {
             ..Default::default()
         };
         let style = Style::default();
-        let (name, labels) =
-            name_and_labels("hello", &unread_info(1, 0), MatrixRoomState::Joined, style, &colors);
+        let (name, labels) = name_and_labels(
+            "hello",
+            &unread_info(1, 0),
+            MatrixRoomState::Joined,
+            style,
+            style,
+            &colors,
+        );
         assert_eq!(
             name,
             Span::styled("hello", style.fg(Color::LightYellow).add_modifier(StyleModifier::BOLD))
@@ -1773,16 +1834,25 @@ mod tests {
             ..Default::default()
         };
         let style = Style::default();
-        let (name, labels) =
-            name_and_labels("hello", &unread_info(3, 1), MatrixRoomState::Joined, style, &colors);
+        let (name, labels) = name_and_labels(
+            "hello",
+            &unread_info(3, 1),
+            MatrixRoomState::Joined,
+            style,
+            style,
+            &colors,
+        );
         assert_eq!(
             name,
             Span::styled("hello", style.fg(Color::LightRed).add_modifier(StyleModifier::BOLD))
         );
-        assert_eq!(labels, vec![vec![Span::styled(
-            "Unread Mention",
-            style.fg(Color::LightRed)
-        )]]);
+        assert_eq!(
+            labels,
+            vec![vec![Span::styled(
+                "Unread Mention",
+                style.fg(Color::LightRed)
+            )]]
+        );
     }
 
     #[test]
@@ -1791,9 +1861,15 @@ mod tests {
             unread: Some(Color::LightYellow),
             ..Default::default()
         };
-        let style = selected_style(true);
-        let (name, _) =
-            name_and_labels("hello", &unread_info(1, 0), MatrixRoomState::Joined, style, &colors);
+        let style = selected_style(true, Style::default());
+        let (name, _) = name_and_labels(
+            "hello",
+            &unread_info(1, 0),
+            MatrixRoomState::Joined,
+            style,
+            style,
+            &colors,
+        );
         assert_eq!(
             name,
             Span::styled("hello", style.fg(Color::LightYellow).add_modifier(StyleModifier::BOLD))
@@ -1807,6 +1883,7 @@ mod tests {
             "hello",
             &unread_info(1, 0),
             MatrixRoomState::Joined,
+            Style::default(),
             Style::default(),
             &ListColorValues::default(),
         );

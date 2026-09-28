@@ -101,17 +101,17 @@ impl fmt::Display for VerifyItem {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.request.state() {
             VerificationRequestState::Requested { .. } => {
-                write!(f, ":verify accept {}", self.request.flow_id())
+                write!(f, ":verify accept {:?}", self.request.flow_id())
             },
             VerificationRequestState::Ready { their_methods, .. }
                 if their_methods.contains(&VerificationMethod::SasV1) =>
             {
-                write!(f, ":verify emoji {}", self.request.flow_id())
+                write!(f, ":verify emoji {:?}", self.request.flow_id())
             },
             VerificationRequestState::Transitioned { verification: Verification::SasV1(sas) } => {
                 match sas.state() {
                     SasState::KeysExchanged { emojis: Some(_), .. } => {
-                        write!(f, ":verify confirm {}", self.request.flow_id())
+                        write!(f, ":verify confirm {:?}", self.request.flow_id())
                     },
                     _ => Ok(()),
                 }
@@ -119,10 +119,10 @@ impl fmt::Display for VerifyItem {
             VerificationRequestState::Transitioned { verification: Verification::QrV1(qr) } => {
                 match qr.state() {
                     QrVerificationState::Started => {
-                        write!(f, ":verify emoji {}", self.request.flow_id())
+                        write!(f, ":verify emoji {:?}", self.request.flow_id())
                     },
                     QrVerificationState::Scanned => {
-                        write!(f, ":verify confirm {}", self.request.flow_id())
+                        write!(f, ":verify confirm {:?}", self.request.flow_id())
                     },
                     _ => Ok(()),
                 }
@@ -133,6 +133,8 @@ impl fmt::Display for VerifyItem {
 }
 
 impl ListItem<IambInfo> for VerifyItem {
+    type Section = &'static str;
+
     fn show(
         &self,
         selected: bool,
@@ -140,9 +142,9 @@ impl ListItem<IambInfo> for VerifyItem {
         store: &mut ProgramStore,
     ) -> Text<'_> {
         let mut lines = vec![];
-        let bold = Style::default().add_modifier(StyleModifier::BOLD);
-        let selected_bold = super::selected_style(selected).add_modifier(StyleModifier::BOLD);
-        let selected = super::selected_style(selected);
+        let style = store.application.settings.theme.default;
+        let bold = style.bold();
+        let selected = super::selected_style(selected, style);
 
         let mut other_device = None;
         let state = match self.request.state() {
@@ -152,7 +154,7 @@ impl ListItem<IambInfo> for VerifyItem {
                 other_device = Some(other_device_data);
 
                 if their_methods.contains(&VerificationMethod::SasV1) {
-                    lines.push(Line::from("    To accept this request, run:"));
+                    lines.push(Line::styled("    To accept this request, run:", style));
                     "requested"
                 } else {
                     "no methods in common"
@@ -165,7 +167,7 @@ impl ListItem<IambInfo> for VerifyItem {
                 other_device = Some(other_device_data);
 
                 if their_methods.contains(&VerificationMethod::SasV1) {
-                    lines.push(Line::from("    To start interactive verification, run:"));
+                    lines.push(Line::styled("    To start interactive verification, run:", style));
                 }
 
                 "ready"
@@ -178,25 +180,27 @@ impl ListItem<IambInfo> for VerifyItem {
                     SasState::Started { .. } |
                     SasState::Accepted { .. } => "starting",
                     SasState::KeysExchanged { emojis: Some(emojis), .. } => {
-                        lines.push(Line::from(
-                            "    Both devices should see the following Emoji sequence:".to_string(),
+                        lines.push(Line::styled(
+                            "    Both devices should see the following Emoji sequence:",
+                            style,
                         ));
-                        lines.push(Line::from(""));
+                        lines.push(Line::styled("", style));
 
                         for line in format_emojis(emojis.emojis).lines() {
-                            lines.push(Line::from(format!("    {line}")));
+                            lines.push(Line::styled(format!("    {line}"), style));
                         }
 
-                        lines.push(Line::from(""));
-                        lines.push(Line::from("    If they don't match, run:"));
-                        lines.push(Line::from(""));
-                        lines.push(Line::from(Span::styled(
-                            format!("        :verify mismatch {}", self.request.flow_id()),
+                        lines.push(Line::styled("", style));
+                        lines.push(Line::styled("    If they don't match, run:", style));
+                        lines.push(Line::styled("", style));
+                        lines.push(Line::styled(
+                            format!("        :verify mismatch {:?}", self.request.flow_id()),
                             bold,
-                        )));
-                        lines.push(Line::from(""));
-                        lines.push(Line::from(
+                        ));
+                        lines.push(Line::styled("", style));
+                        lines.push(Line::styled(
                             "    If everything looks right, you can confirm with:",
+                            style,
                         ));
                         "running"
                     },
@@ -204,7 +208,8 @@ impl ListItem<IambInfo> for VerifyItem {
                     SasState::Confirmed => "waiting for response",
                     SasState::Done { .. } => "done",
                     SasState::Cancelled(info) => {
-                        lines.push(Line::from(format!("    Cancelled: {}", info.reason())));
+                        lines
+                            .push(Line::styled(format!("    Cancelled: {}", info.reason()), style));
                         "cancelled"
                     },
                 }
@@ -222,31 +227,39 @@ impl ListItem<IambInfo> for VerifyItem {
                                     .map(|line| Line::styled(line.to_owned(), BLACK_ON_WHITE)),
                             );
 
-                            lines.push(Line::from("    Scan this QR code with the other device."));
-                            lines.push(Line::from(
+                            lines.push(Line::styled(
+                                "    Scan this QR code with the other device.",
+                                style,
+                            ));
+                            lines.push(Line::styled(
                                 "    To alternativly start interactive verification, run:",
+                                style,
                             ));
                         } else {
-                            lines.push(Line::from("    To start interactive verification, run:"));
+                            lines.push(Line::styled(
+                                "    To start interactive verification, run:",
+                                style,
+                            ));
                         }
 
                         "ready"
                     },
                     QrVerificationState::Scanned => {
-                        lines.push(Line::from(
-                            "    Check whether the other device shows a successful verification."
-                                .to_string(),
+                        lines.push(Line::styled(
+                            "    Check whether the other device shows a successful verification.",
+                            style,
                         ));
-                        lines.push(Line::from(""));
-                        lines.push(Line::from("    If it shows an error, run:"));
-                        lines.push(Line::from(""));
-                        lines.push(Line::from(Span::styled(
-                            format!("        :verify mismatch {}", self.request.flow_id()),
+                        lines.push(Line::styled("", style));
+                        lines.push(Line::styled("    If it shows an error, run:", style));
+                        lines.push(Line::styled("", style));
+                        lines.push(Line::styled(
+                            format!("        :verify mismatch {:?}", self.request.flow_id()),
                             bold,
-                        )));
-                        lines.push(Line::from(""));
-                        lines.push(Line::from(
+                        ));
+                        lines.push(Line::styled("", style));
+                        lines.push(Line::styled(
                             "    If everything looks right, you can confirm with:",
+                            style,
                         ));
                         "running"
                     },
@@ -259,7 +272,8 @@ impl ListItem<IambInfo> for VerifyItem {
                     },
                     QrVerificationState::Done { .. } => "done",
                     QrVerificationState::Cancelled(info) => {
-                        lines.push(Line::from(format!("    Cancelled: {}", info.reason())));
+                        lines
+                            .push(Line::styled(format!("    Cancelled: {}", info.reason()), style));
                         "cancelled"
                     },
                 }
@@ -267,7 +281,7 @@ impl ListItem<IambInfo> for VerifyItem {
             VerificationRequestState::Transitioned { .. } => "unsupported method",
             VerificationRequestState::Done => "done",
             VerificationRequestState::Cancelled(info) => {
-                lines.push(Line::from(format!("    Cancelled: {}", info.reason())));
+                lines.push(Line::styled(format!("    Cancelled: {}", info.reason()), style));
                 "cancelled"
             },
         };
@@ -277,13 +291,13 @@ impl ListItem<IambInfo> for VerifyItem {
                 if let Some(display_name) = device.display_name() {
                     vec![
                         Span::styled("Device verification with ", selected),
-                        Span::styled(display_name.to_owned(), selected_bold),
+                        Span::styled(display_name.to_owned(), selected.bold()),
                         Span::styled(format!(" ({state})"), selected),
                     ]
                 } else {
                     vec![
                         Span::styled("Device verification with ", selected),
-                        Span::styled(device.device_id().to_string(), selected_bold),
+                        Span::styled(device.device_id().to_string(), selected.bold()),
                         Span::styled(format!(" ({state})"), selected),
                     ]
                 }
@@ -297,7 +311,7 @@ impl ListItem<IambInfo> for VerifyItem {
             let color = store.application.settings.get_user_color(self.request.other_user_id());
             vec![
                 Span::styled("User verification with ", selected),
-                Span::styled(self.request.other_user_id().as_str(), selected_bold.patch(color)),
+                Span::styled(self.request.other_user_id().as_str(), selected.bold().patch(color)),
                 Span::styled(format!(" ({state})"), selected),
             ]
         };
@@ -306,14 +320,14 @@ impl ListItem<IambInfo> for VerifyItem {
         let cmd = self.to_string();
 
         if !cmd.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![Span::from("        "), Span::styled(cmd, bold)]));
+            lines.push(Line::styled("", style));
+            lines.push(Line::from(vec![Span::styled("        ", style), Span::styled(cmd, bold)]));
             if self.show_help {
-                lines.push(Line::from(""));
+                lines.push(Line::styled("", style));
                 lines.push(Line::from(vec![
-                    Span::from("You can copy the above command with "),
+                    Span::styled("You can copy the above command with ", style),
                     Span::styled("yy", bold),
-                    Span::from(" and then execute it with "),
+                    Span::styled(" and then execute it with ", style),
                     Span::styled("@\"", bold),
                 ]));
             }
