@@ -124,6 +124,38 @@ fn looks_like_windows_path(s: &str) -> bool {
     }
 }
 
+fn iamb_ignore(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    let mut iter = desc.arg.strings()?.into_iter();
+    let action = iter.next().ok_or(CommandError::InvalidArgument)?;
+    let arg = iter.next();
+
+    if iter.next().is_some() {
+        return Err(CommandError::InvalidArgument);
+    }
+
+    let act: IambAction = match (action.as_str(), arg) {
+        ("set", Some(user)) => HomeserverAction::AccountSet(AccountField::Ignore, user).into(),
+        ("set", None) => return Err(CommandError::InvalidArgument),
+
+        ("show", None) => HomeserverAction::AccountShow(AccountField::Ignore).into(),
+        ("show", Some(_)) => return Err(CommandError::InvalidArgument),
+
+        ("unset", Some(user)) => {
+            HomeserverAction::AccountUnset(AccountField::Ignore, Some(user)).into()
+        },
+        ("unset", None) => return Err(CommandError::InvalidArgument),
+
+        (op, _) => {
+            let msg = format!("unknown `:ignore` operation: {op:?}");
+            return Err(CommandError::Error(msg));
+        },
+    };
+
+    let step = CommandStep::Continue(act.into(), ctx.context.clone());
+
+    return Ok(step);
+}
+
 fn iamb_invite(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
     let args = desc.arg.strings()?;
 
@@ -610,6 +642,22 @@ fn iamb_self(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
         },
         ("avatar", "unset", Some(_)) => return Result::Err(CommandError::InvalidArgument),
 
+        // :self invites show
+        ("invites", "show", None) => HomeserverAction::AccountShow(AccountField::Invites).into(),
+        ("invites", "show", Some(_)) => return Result::Err(CommandError::InvalidArgument),
+
+        // :self invites set
+        ("invites", "set", Some(s)) => {
+            HomeserverAction::AccountSet(AccountField::Invites, s).into()
+        },
+        ("invites", "set", None) => return Result::Err(CommandError::InvalidArgument),
+
+        // :self invites unset
+        ("invites", "unset", None) => {
+            HomeserverAction::AccountUnset(AccountField::Invites, None).into()
+        },
+        ("invites", "unset", Some(_)) => return Result::Err(CommandError::InvalidArgument),
+
         // :self name show
         ("name" | "nick", "show", None) => {
             HomeserverAction::ProfileFieldShow(ProfileFieldName::DisplayName).into()
@@ -658,14 +706,43 @@ fn iamb_self(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
 }
 
 fn iamb_spaces(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
-    if !desc.arg.text.is_empty() {
+    let mut args = desc.arg.strings()?;
+
+    if args.len() > 1 {
         return Result::Err(CommandError::InvalidArgument);
     }
 
-    let open = ctx.switch(OpenTarget::Application(IambId::SpaceList));
-    let step = CommandStep::Continue(open, ctx.context.clone());
+    match args.pop().as_deref() {
+        Some("toplevel") => {
+            let open = ctx.switch(OpenTarget::Application(IambId::ToplevelSpaceList));
+            let step = CommandStep::Continue(open, ctx.context.clone());
 
-    return Ok(step);
+            return Ok(step);
+        },
+        Some(_) => return Result::Err(CommandError::InvalidArgument),
+        None => {
+            let open = ctx.switch(OpenTarget::Application(IambId::SpaceList));
+            let step = CommandStep::Continue(open, ctx.context.clone());
+
+            return Ok(step);
+        },
+    }
+}
+
+fn iamb_theme(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
+    let mut args = desc.arg.strings()?;
+
+    if args.len() > 1 {
+        return Result::Err(CommandError::InvalidArgument);
+    }
+
+    if let Some(theme) = args.pop() {
+        let theme = IambAction::ChangeTheme(theme);
+        let step = CommandStep::Continue(theme.into(), ctx.context.clone());
+        return Ok(step);
+    } else {
+        return Result::Err(CommandError::InvalidArgument);
+    }
 }
 
 fn iamb_welcome(desc: CommandDescription, ctx: &mut ProgContext) -> ProgResult {
@@ -1180,6 +1257,11 @@ pub fn add_iamb_commands(cmds: &mut ProgramCommands) {
         f: iamb_forget,
     });
     cmds.add_command(ProgramCommand {
+        name: "ignore".into(),
+        aliases: vec![],
+        f: iamb_ignore,
+    });
+    cmds.add_command(ProgramCommand {
         name: "invite".into(),
         aliases: vec![],
         f: iamb_invite,
@@ -1259,6 +1341,11 @@ pub fn add_iamb_commands(cmds: &mut ProgramCommands) {
         f: iamb_invites,
     });
     cmds.add_command(ProgramCommand { name: "self".into(), aliases: vec![], f: iamb_self });
+    cmds.add_command(ProgramCommand {
+        name: "theme".into(),
+        aliases: vec![],
+        f: iamb_theme,
+    });
     cmds.add_command(ProgramCommand {
         name: "unreact".into(),
         aliases: vec![],

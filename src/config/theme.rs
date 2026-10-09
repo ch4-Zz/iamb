@@ -2,6 +2,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+use anyhow::Context;
 use ratatui::widgets::BorderType;
 use serde::de::Error as SerdeError;
 use serde::de::Visitor;
@@ -64,7 +65,25 @@ pub fn default_theme() -> Theme {
             ..Default::default()
         },
         rooms: ThemeRooms {
-            unread: Stylable::with_modifiers(StyleModifier::BOLD),
+            unread: ThemeRoomsUnreads {
+                number: Stylable::fg(Color::Gray),
+                ..Default::default()
+            },
+            notification: ThemeRoomsUnreads {
+                name: Stylable::with_modifiers(StyleModifier::BOLD),
+                number: Stylable::fg(Color::Yellow),
+                ..Default::default()
+            },
+            mention: ThemeRoomsUnreads {
+                name: Stylable::with_modifiers(StyleModifier::BOLD),
+                number: Stylable::fg(Color::Red),
+                ..Default::default()
+            },
+            marked_unread: ThemeRoomsUnreads {
+                name: Stylable::with_modifiers(StyleModifier::BOLD),
+                number: Stylable::fg(Color::Green),
+                ..Default::default()
+            },
             ..Default::default()
         },
         users: ThemeUsers {
@@ -86,6 +105,60 @@ pub fn default_theme() -> Theme {
             stylable: Stylable::with_modifiers(StyleModifier::BOLD),
         },
         ..Default::default()
+    }
+}
+
+pub fn find_themes(dir: &Path) -> anyhow::Result<Vec<(String, Theme)>> {
+    let entries = std::fs::read_dir(dir)
+        .with_context(|| format!("Cannot list {} contents", dir.display()))?;
+    let mut themes = vec![];
+
+    for res in entries {
+        let Ok(entry) = res else {
+            continue;
+        };
+
+        let path = entry.path();
+
+        if !path.is_file() {
+            // Skip non-files.
+            continue;
+        }
+
+        if path.extension().is_none_or(|ext| ext != "toml") {
+            // Skip non-`.toml` files.
+            continue;
+        }
+
+        let Some(name) = path.file_stem() else {
+            continue;
+        };
+
+        let file = ThemeFile::load(&path)?;
+        let name = name.to_string_lossy().into_owned();
+        themes.push((name, file.theme));
+    }
+
+    Ok(themes)
+}
+
+/// A restricted subset of `config.toml` that only allows specifying themes.
+///
+/// This exists mainly to prevent people from thinking that values they put
+/// into the theme files are taking effect when they aren't: theme files are
+/// only used for sourcing theme information to prevent any weirdness around
+/// what happens when changing the theme with `:theme`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThemeFile {
+    pub theme: Theme,
+}
+
+impl ThemeFile {
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let input = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        toml::de::from_str(&input).with_context(|| format!("failed to read {}", path.display()))
     }
 }
 
@@ -529,9 +602,17 @@ struct ThemeRooms {
     #[serde(default)]
     labels: Stylable,
 
-    // XXX: use different colors for "mention", "notification", "muted room"
     #[serde(default)]
-    unread: Stylable,
+    unread: ThemeRoomsUnreads,
+
+    #[serde(default)]
+    notification: ThemeRoomsUnreads,
+
+    #[serde(default)]
+    mention: ThemeRoomsUnreads,
+
+    #[serde(default)]
+    marked_unread: ThemeRoomsUnreads,
 }
 
 impl ThemeRooms {
@@ -540,15 +621,28 @@ impl ThemeRooms {
             default: self.default.merge(other.default),
             labels: self.labels.merge(other.labels),
             unread: self.unread.merge(other.unread),
+            notification: self.notification.merge(other.notification),
+            mention: self.mention.merge(other.mention),
+            marked_unread: self.marked_unread.merge(other.marked_unread),
         }
     }
 
     fn values(self, base: Style) -> ThemeRoomsValues {
         let default = base.patch(self.default);
         let labels = default.patch(self.labels);
-        let unread = default.patch(self.unread);
+        let unread = self.unread.values(default, labels);
+        let notification = self.notification.values(default, labels);
+        let mention = self.mention.values(default, labels);
+        let marked_unread = self.marked_unread.values(default, labels);
 
-        ThemeRoomsValues { default, labels, unread }
+        ThemeRoomsValues {
+            default,
+            labels,
+            unread,
+            notification,
+            mention,
+            marked_unread,
+        }
     }
 }
 
@@ -556,7 +650,47 @@ impl ThemeRooms {
 pub struct ThemeRoomsValues {
     pub default: Style,
     pub labels: Style,
-    pub unread: Style,
+    pub unread: ThemeRoomsUnreadsValues,
+    pub notification: ThemeRoomsUnreadsValues,
+    pub mention: ThemeRoomsUnreadsValues,
+    pub marked_unread: ThemeRoomsUnreadsValues,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ThemeRoomsUnreads {
+    #[serde(default)]
+    name: Stylable,
+
+    #[serde(default)]
+    number: Stylable,
+
+    #[serde(default)]
+    labels: Stylable,
+}
+
+impl ThemeRoomsUnreads {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            name: self.name.merge(other.name),
+            number: self.number.merge(other.number),
+            labels: self.labels.merge(other.labels),
+        }
+    }
+
+    fn values(self, base: Style, labels_base: Style) -> ThemeRoomsUnreadsValues {
+        let name = base.patch(self.name);
+        let number = base.patch(self.number);
+        let labels = labels_base.patch(self.labels);
+
+        ThemeRoomsUnreadsValues { name, number, labels }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ThemeRoomsUnreadsValues {
+    pub name: Style,
+    pub number: Style,
+    pub labels: Style,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

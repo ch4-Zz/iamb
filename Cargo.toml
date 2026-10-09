@@ -82,13 +82,13 @@ version = "4.12"
 optional = true
 
 [dependencies.modalkit]
-version = "0.0.30"
+version = "0.0.31"
 default-features = false
 #git = "https://github.com/ulyssa/modalkit"
 #rev = "31158b7b759ef6f4b3c0d56305fa8a68365d8a96"
 
 [dependencies.modalkit-ratatui]
-version = "0.0.30"
+version = "0.0.31"
 #git = "https://github.com/ulyssa/modalkit"
 #rev = "31158b7b759ef6f4b3c0d56305fa8a68365d8a96"
 
@@ -105,7 +105,7 @@ version = "0.19.0"
 
 [dependencies.tokio]
 version = "1.24.1"
-features = ["macros", "net", "rt-multi-thread", "sync", "time"]
+features = ["io-std", "macros", "net", "rt-multi-thread", "sync", "time"]
 
 [dependencies.ratatui-image]
 version = "11.0.8"
@@ -138,6 +138,7 @@ assets = [
     # Other assets:
     ["iamb.desktop", "usr/share/applications/iamb.desktop", "644"],
     ["config.example.toml", "usr/share/iamb/config.example.toml", "644"],
+    ["config.full.toml", "usr/share/iamb/config.full.toml", "644"],
     ["docs/iamb.svg", "usr/share/icons/hicolor/scalable/apps/iamb.svg", "644"],
     ["docs/iamb.metainfo.xml", "usr/share/metainfo/iamb.metainfo.xml", "644"],
 ]
@@ -153,6 +154,7 @@ assets = [
     # Other assets:
     { source = "iamb.desktop", dest = "/usr/share/applications/iamb.desktop", mode = "644" },
     { source = "config.example.toml", dest = "/usr/share/iamb/config.example.toml", mode = "644"},
+    { source = "config.full.toml", dest = "/usr/share/iamb/config.full.toml", mode = "644"},
     { source = "docs/iamb.svg", dest = "/usr/share/icons/hicolor/scalable/apps/iamb.svg", mode = "644"},
     { source = "docs/iamb.metainfo.xml", dest = "/usr/share/metainfo/iamb.metainfo.xml", mode = "644"},
 ]

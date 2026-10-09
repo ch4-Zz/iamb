@@ -199,7 +199,7 @@ pub async fn room_command(
             let cmd = cmd.default_relation(MoveDir1D::Next);
 
             let act = match store.application.settings.tunables.members_split {
-                Some(dir) => cmd.default_axis(dir.to_axis()).window(target, None),
+                Some(dir) => cmd.default_axis(dir.into()).window(target, None),
                 None => cmd.switch(target),
             };
 
@@ -983,6 +983,10 @@ impl TerminalCursor for RoomState {
 
 impl WindowOps<IambInfo> for RoomState {
     fn draw(&mut self, area: Rect, buf: &mut Buffer, focused: bool, store: &mut ProgramStore) {
+        let theme = &store.application.settings.theme;
+        let default_style = theme.timeline.default;
+        buf.set_style(area, default_style);
+
         if self.room_state() != Some(MatrixRoomState::Joined) {
             self.refresh_room(store);
         }

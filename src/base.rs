@@ -14,7 +14,6 @@ use matrix_sdk::ruma::events::poll::unstable_start::{
 };
 use matrix_sdk::ruma::events::reaction::ReactionEvent;
 use matrix_sdk::ruma::events::relation::Replacement;
-use matrix_sdk::ruma::events::room::encrypted::Relation as EncryptedRelation;
 use matrix_sdk::ruma::events::room::encrypted::RoomEncryptedEvent;
 use matrix_sdk::ruma::events::room::message::RelationWithoutReplacement;
 use matrix_sdk::ruma::events::room::message::{
@@ -25,6 +24,7 @@ use matrix_sdk::ruma::events::room::redaction::{
     OriginalSyncRoomRedactionEvent,
     SyncRoomRedactionEvent,
 };
+use matrix_sdk::ruma::events::space::child::SpaceChildEventContent;
 use matrix_sdk::ruma::events::sticker::{StickerEvent, StickerEventContent};
 use matrix_sdk::ruma::events::{MessageLikeEvent, OriginalMessageLikeEvent};
 use matrix_sdk::ruma::presence::PresenceState;
@@ -247,11 +247,33 @@ pub enum SortFieldRoom {
     /// Sort rooms by whether they have unread messages.
     Unread,
 
+    /// Sort rooms by whether they have unread notifications.
+    Notifications,
+
+    /// Sort rooms by whether they have unread mentions.
+    Mentions,
+
     /// Sort rooms by the timestamps of their most recent messages.
     Recent,
 
+    /// Sort rooms by whether they are direct messages.
+    Direct,
+
+    /// Sort rooms by whether they are spaces.
+    Space,
+
     /// Sort rooms by whether they are invites.
     Invite,
+
+    /// Sort rooms by whether the user has joined them.
+    Joined,
+}
+
+/// Fields that space children can be sorted by.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SortFieldSpace {
+    Room(SortFieldRoom),
+    SpaceOrder,
 }
 
 /// Fields that users can be sorted by.
@@ -315,14 +337,65 @@ impl Visitor<'_> for SortRoomVisitor {
             "lowpriority" => SortFieldRoom::LowPriority,
             "recent" => SortFieldRoom::Recent,
             "unread" => SortFieldRoom::Unread,
+            "notifications" => SortFieldRoom::Notifications,
+            "mentions" => SortFieldRoom::Mentions,
             "name" => SortFieldRoom::Name,
             "alias" => SortFieldRoom::Alias,
+            "dm" => SortFieldRoom::Direct,
             "id" => SortFieldRoom::RoomId,
             "server" => SortFieldRoom::Server,
+            "space" => SortFieldRoom::Space,
             "invite" => SortFieldRoom::Invite,
+            "joined" => SortFieldRoom::Joined,
             _ => {
                 let msg = format!("Unknown sort field: {value:?}");
                 return Err(E::custom(msg));
+            },
+        };
+
+        Ok(SortColumn(field, order))
+    }
+}
+
+impl<'de> Deserialize<'de> for SortColumn<SortFieldSpace> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(SortSpaceVisitor)
+    }
+}
+
+/// [serde] visitor for deserializing [SortColumn] for rooms and spaces.
+struct SortSpaceVisitor;
+
+impl Visitor<'_> for SortSpaceVisitor {
+    type Value = SortColumn<SortFieldSpace>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a valid field for sorting space children")
+    }
+
+    fn visit_str<E>(self, mut value: &str) -> Result<Self::Value, E>
+    where
+        E: SerdeError,
+    {
+        if value.is_empty() {
+            return Err(E::custom("Invalid sort field"));
+        }
+
+        let order = if value.starts_with('~') {
+            value = &value[1..];
+            SortOrder::Descending
+        } else {
+            SortOrder::Ascending
+        };
+
+        let field = match value {
+            "spaceorder" => SortFieldSpace::SpaceOrder,
+            _ => {
+                let room_column = SortRoomVisitor.visit_str(value)?;
+                SortFieldSpace::Room(room_column.0)
             },
         };
 
@@ -379,6 +452,16 @@ impl Visitor<'_> for SortUserVisitor {
 
         Ok(SortColumn(field, order))
     }
+}
+
+/// An account property.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AccountField {
+    /// The account's ignore list.
+    Ignore,
+
+    /// Set whether other user's are allowed to invite the user to rooms.
+    Invites,
 }
 
 /// A room property.
@@ -581,6 +664,15 @@ pub enum HomeserverAction {
     /// Create a new room with an optional localpart.
     CreateRoom(Option<String>, CreateRoomType, CreateRoomFlags),
 
+    /// Update an account property.
+    AccountSet(AccountField, String),
+
+    /// Show information about an account property.
+    AccountShow(AccountField),
+
+    /// Remove a user from the account's ignore list.
+    AccountUnset(AccountField, Option<String>),
+
     /// "Knock" on a room, aka "request to join".
     KnockSend(OwnedRoomOrAliasId, Option<String>),
 
@@ -653,6 +745,9 @@ pub enum IambAction {
     /// Toggle the focus within the focused room.
     ToggleScrollbackFocus,
 
+    /// Change the current theme.
+    ChangeTheme(String),
+
     /// Clear all unread messages.
     ClearUnreads,
 }
@@ -709,6 +804,7 @@ impl From<TimelineAction> for IambAction {
 impl ApplicationAction for IambAction {
     fn is_edit_sequence(&self, _: &EditContext) -> SequenceStatus {
         match self {
+            IambAction::ChangeTheme(..) => SequenceStatus::Break,
             IambAction::ClearUnreads => SequenceStatus::Break,
             IambAction::Homeserver(..) => SequenceStatus::Break,
             IambAction::Keys(..) => SequenceStatus::Break,
@@ -728,6 +824,7 @@ impl ApplicationAction for IambAction {
 
     fn is_last_action(&self, _: &EditContext) -> SequenceStatus {
         match self {
+            IambAction::ChangeTheme(..) => SequenceStatus::Atom,
             IambAction::ClearUnreads => SequenceStatus::Atom,
             IambAction::Homeserver(..) => SequenceStatus::Atom,
             IambAction::Keys(..) => SequenceStatus::Atom,
@@ -747,6 +844,7 @@ impl ApplicationAction for IambAction {
 
     fn is_last_selection(&self, _: &EditContext) -> SequenceStatus {
         match self {
+            IambAction::ChangeTheme(..) => SequenceStatus::Ignore,
             IambAction::ClearUnreads => SequenceStatus::Ignore,
             IambAction::Homeserver(..) => SequenceStatus::Ignore,
             IambAction::Keys(..) => SequenceStatus::Ignore,
@@ -766,6 +864,7 @@ impl ApplicationAction for IambAction {
 
     fn is_switchable(&self, _: &EditContext) -> bool {
         match self {
+            IambAction::ChangeTheme(..) => false,
             IambAction::ClearUnreads => false,
             IambAction::Homeserver(..) => false,
             IambAction::Message(..) => false,
@@ -845,7 +944,7 @@ pub enum IambError {
     InvalidNotificationLevel(String),
 
     /// An invalid user identifier was specified.
-    #[error("Invalid user identifier: {0}")]
+    #[error("Invalid user identifier: {0:?}")]
     InvalidUserId(String),
 
     /// An invalid user identifier was specified.
@@ -979,6 +1078,12 @@ impl From<matrix_sdk::event_cache::EventCacheError> for IambError {
     }
 }
 
+impl From<matrix_sdk::authentication::oauth::OAuthError> for IambError {
+    fn from(value: matrix_sdk::authentication::oauth::OAuthError) -> Self {
+        Self::from(matrix_sdk::Error::from(value))
+    }
+}
+
 impl ApplicationError for IambError {}
 
 /// Indicates where an [EventId] lives in the [ChatStore].
@@ -1046,8 +1151,22 @@ impl UnreadInfo {
         self.unread_mentions > 0
     }
 
+    pub fn has_notification(&self) -> bool {
+        self.unread_notifications > 0
+    }
+
     pub fn latest(&self) -> Option<&MessageTimeStamp> {
         self.latest.as_ref()
+    }
+}
+
+impl std::ops::AddAssign<Self> for UnreadInfo {
+    fn add_assign(&mut self, rhs: Self) {
+        self.unread_mark |= rhs.unread_mark;
+        self.unread_messages += rhs.unread_messages;
+        self.unread_notifications += rhs.unread_notifications;
+        self.unread_mentions += rhs.unread_mentions;
+        self.latest = self.latest.max(rhs.latest);
     }
 }
 
@@ -1178,6 +1297,21 @@ impl DisplayNameStore {
     }
 }
 
+bitflags::bitflags! {
+    /// Additional information about a room.
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct RoomInfoFlags: u32 {
+        /// No flags specified.
+        const NONE = 0b00000000;
+
+        /// All notifications for this room have been muted.
+        const MUTED = 0b00000001;
+
+        /// Non-mention/keyword notifications for this room have been muted.
+        const CALMED = 0b00000010;
+    }
+}
+
 /// Information about room's the user's joined.
 pub struct RoomInfo {
     /// The display name for this room.
@@ -1185,6 +1319,8 @@ pub struct RoomInfo {
 
     /// The tags placed on this room.
     pub tags: Option<Tags>,
+
+    pub flags: RoomInfoFlags,
 
     /// A map of event IDs to where they are stored in this struct.
     pub keys: HashMap<OwnedEventId, EventLocation>,
@@ -1248,6 +1384,7 @@ impl Default for RoomInfo {
             name: Default::default(),
             tags: Default::default(),
             keys: Default::default(),
+            flags: Default::default(),
             echo_keys: Default::default(),
             event_receipts: Default::default(),
             user_receipts: Default::default(),
@@ -2178,6 +2315,13 @@ fn emoji_map() -> CompletionMap<String, &'static Emoji> {
     return emojis;
 }
 
+/// Information about spaces the user's joined.
+#[derive(Default)]
+pub struct SpaceInfo {
+    /// The space child events with content and `origin_server_ts`.
+    pub children: HashMap<OwnedRoomId, (SpaceChildEventContent, MilliSecondsSinceUnixEpoch)>,
+}
+
 /// Information gathered during server syncs about joined rooms.
 #[derive(Default)]
 pub struct SyncInfo {
@@ -2306,7 +2450,10 @@ pub struct ChatStore {
     /// Cache of encountered `via` parameters in room links.
     ///
     /// This is stored here because this data is lost in the conversion to [IambId].
-    pub room_via: HashMap<OwnedRoomOrAliasId, Vec<OwnedServerName>>,
+    pub room_via: HashMap<OwnedRoomOrAliasId, HashSet<OwnedServerName>>,
+
+    /// Map of joined spaces.
+    pub spaces: HashMap<OwnedRoomId, SpaceInfo>,
 
     /// Map of room aliases.
     pub aliases: CompletionMap<OwnedRoomAliasId, OwnedRoomId>,
@@ -2370,6 +2517,7 @@ impl ChatStore {
             rooms: Default::default(),
             room_previews: Default::default(),
             room_via: Default::default(),
+            spaces: Default::default(),
             presences: Default::default(),
             verifications: Default::default(),
             need_load: Default::default(),
@@ -2382,6 +2530,22 @@ impl ChatStore {
         };
 
         Ok(store)
+    }
+
+    /// Clear the `EventCache` for all rooms.
+    ///
+    /// This forces a re-fetch of the most recent messages in joined rooms afterwards,
+    /// which makes sure that we re-fetch any missing events (such as those sent by
+    /// recently unignored users that a re-fetch would make appear in the timeline).
+    pub async fn clear_room_cache(&mut self, client: &Client) -> Result<(), IambError> {
+        client.event_cache().clear_all_rooms().await?;
+        for room in client.joined_rooms() {
+            let room_id = room.room_id().to_owned();
+            let room = self.rooms.get_or_default(room_id.clone());
+            room.reached_timeline_start = false;
+            self.need_load.need_messages(room_id.to_owned());
+        }
+        Ok(())
     }
 
     /// Get a joined room.
@@ -2421,6 +2585,7 @@ impl ChatStore {
         name: String,
         tags: Option<Tags>,
         aliases: Vec<OwnedRoomAliasId>,
+        flags: RoomInfoFlags,
     ) {
         for alias in aliases {
             self.aliases.insert(alias, room_id.clone());
@@ -2428,6 +2593,7 @@ impl ChatStore {
 
         let info = self.rooms.get_or_default(room_id);
         info.name = name.into();
+        info.flags = flags;
         info.tags = tags;
     }
 }
@@ -2454,6 +2620,9 @@ pub enum IambId {
 
     /// The `:spaces` window.
     SpaceList,
+
+    /// The `:spaces toplevel` window.
+    ToplevelSpaceList,
 
     /// The `:verify` window.
     VerifyList,
@@ -2494,6 +2663,7 @@ impl Display for IambId {
             IambId::DirectList => f.write_str("iamb://dms"),
             IambId::RoomList => f.write_str("iamb://rooms"),
             IambId::SpaceList => f.write_str("iamb://spaces"),
+            IambId::ToplevelSpaceList => f.write_str("iamb://spaces/toplevel"),
             IambId::VerifyList => f.write_str("iamb://verify"),
             IambId::Welcome => f.write_str("iamb://welcome"),
             IambId::ChatList => f.write_str("iamb://chats"),
@@ -2613,8 +2783,12 @@ impl Visitor<'_> for IambIdVisitor {
                 Ok(IambId::RoomList)
             },
             Some("spaces") => {
+                if url.path() == "toplevel" {
+                    return Ok(IambId::ToplevelSpaceList);
+                }
+
                 if url.path() != "" {
-                    return Err(E::custom("iamb://spaces takes no path"));
+                    return Err(E::custom("Invalid iamb window URL"));
                 }
 
                 Ok(IambId::SpaceList)
@@ -2723,6 +2897,9 @@ pub enum IambBufferId {
     /// The `:spaces` window.
     SpaceList,
 
+    /// The `:spaces toplevel` window.
+    ToplevelSpaceList,
+
     /// The `:verify` window.
     VerifyList,
 
@@ -2755,6 +2932,7 @@ impl IambBufferId {
             IambBufferId::PinnedList(room) => IambId::PinnedList(room.clone()),
             IambBufferId::RoomList => IambId::RoomList,
             IambBufferId::SpaceList => IambId::SpaceList,
+            IambBufferId::ToplevelSpaceList => IambId::ToplevelSpaceList,
             IambBufferId::VerifyList => IambId::VerifyList,
             IambBufferId::Welcome => IambId::Welcome,
             IambBufferId::ChatList => IambId::ChatList,
