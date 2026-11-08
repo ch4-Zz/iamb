@@ -86,14 +86,16 @@ fn config_tab_to_desc(
             let window = match window {
                 config::WindowPath::UserId(user_id) => {
                     if let Some(dm) = store.application.worker.client.get_dm_room(&user_id) {
-                        IambId::Room(dm.room_id().to_owned().into(), None)
+                        IambId::Room(dm.room_id().to_owned().into(), RoomView::Main)
                     } else {
                         let room_id = store.application.worker.create_dm(user_id)?;
-                        IambId::Room(room_id.into(), None)
+                        IambId::Room(room_id.into(), RoomView::Main)
                     }
                 },
-                config::WindowPath::RoomId(room_id) => IambId::Room(room_id.into(), None),
-                config::WindowPath::AliasId(alias_id) => IambId::Room(alias_id.into(), None),
+                config::WindowPath::RoomId(room_id) => IambId::Room(room_id.into(), RoomView::Main),
+                config::WindowPath::AliasId(alias_id) => {
+                    IambId::Room(alias_id.into(), RoomView::Main)
+                },
                 config::WindowPath::Window(id) => id,
             };
 
@@ -128,6 +130,8 @@ fn resolve_mxid(
     id: MatrixId,
     via: Vec<OwnedServerName>,
 ) -> IambResult<IambId> {
+    let mut view = RoomView::Main;
+
     let alias_id = match id {
         MatrixId::Room(room_id) => room_id.into(),
         MatrixId::RoomAlias(alias) => {
@@ -144,8 +148,8 @@ fn resolve_mxid(
                 store.application.worker.create_dm(user_id.to_owned())?.into()
             }
         },
-        MatrixId::Event(alias_id, _) => {
-            // ignore event id for now
+        MatrixId::Event(alias_id, event_id) => {
+            view = RoomView::Message(event_id.into());
             alias_id
         },
         _ => {
@@ -161,7 +165,7 @@ fn resolve_mxid(
         .or_default()
         .extend(via);
 
-    Ok(IambId::Room(alias_id, None))
+    Ok(IambId::Room(alias_id, view))
 }
 
 fn setup_screen(
@@ -176,7 +180,7 @@ fn setup_screen(
     if let Some((id, via)) = initial_room {
         match resolve_mxid(store, id, via) {
             Ok(id) => {
-                return Ok(ScreenState::new(IambWindow::open(id, store)?, cmd));
+                return Ok(ScreenState::new(IambWindow::open(id, OpenFlags::NONE, store)?, cmd));
             },
             Err(err) => {
                 store.application.draw_error = Some(format!("layout restore: {err}"));
@@ -213,8 +217,8 @@ fn setup_screen(
     let win = settings
         .tunables
         .default_room
-        .and_then(|room| IambWindow::find(room, store).ok())
-        .or_else(|| IambWindow::open(IambId::Welcome, store).ok())
+        .and_then(|room| IambWindow::find(room, OpenFlags::NONE, store).ok())
+        .or_else(|| IambWindow::open(IambId::Welcome, OpenFlags::NONE, store).ok())
         .unwrap();
 
     return Ok(ScreenState::new(win, cmd));
@@ -484,7 +488,7 @@ impl Application {
                         // Switch to the right window.
                         if let Some(winid) = content.to_window() {
                             let open = OpenTarget::Application(winid);
-                            let open = WindowAction::Switch(open);
+                            let open = WindowAction::Switch(open, OpenFlags::NONE);
                             let _ = self.screen.window_command(&open, &ctx, store)?;
 
                             // Run command again.
@@ -583,7 +587,11 @@ impl Application {
                     return Err(UIError::Failure(err.to_string()));
                 };
 
-                store.application.settings.theme = Arc::new(theme.clone().values());
+                self.dirty = true;
+                self.theme = Arc::new(theme.clone().values());
+                store.application.settings.theme = self.theme.clone();
+                self.screen.clear_message();
+
                 None
             },
             IambAction::ClearUnreads => {
@@ -618,7 +626,11 @@ impl Application {
             },
             IambAction::Keys(act) => self.keys_command(act, ctx, store).await?,
             IambAction::Message(act) => {
-                self.screen.current_window_mut()?.message_command(act, ctx, store).await?
+                let acts =
+                    self.screen.current_window_mut()?.message_command(act, ctx, store).await?;
+                self.action_prepend(acts);
+
+                None
             },
             IambAction::Space(act) => {
                 self.screen.current_window_mut()?.space_command(act, ctx, store).await?
@@ -658,7 +670,7 @@ impl Application {
                     match resolve_mxid(store, id.to_owned(), via.to_vec()) {
                         Ok(id) => {
                             let target = OpenTarget::Application(id);
-                            let action = WindowAction::Switch(target);
+                            let action = WindowAction::Switch(target, OpenFlags::NONE);
 
                             self.action_prepend(vec![(action.into(), ctx)]);
                             None
@@ -700,9 +712,9 @@ impl Application {
             HomeserverAction::CreateRoom(alias, vis, flags) => {
                 let client = &store.application.worker.client;
                 let room_id = create_room(client, alias, vis, flags).await?;
-                let room = IambId::Room(room_id.into(), None);
+                let room = IambId::Room(room_id.into(), RoomView::Main);
                 let target = OpenTarget::Application(room);
-                let action = WindowAction::Switch(target);
+                let action = WindowAction::Switch(target, OpenFlags::NONE);
 
                 Ok(vec![(action.into(), ctx)])
             },
@@ -866,7 +878,7 @@ impl Application {
             },
             HomeserverAction::ProfileFieldShow(field) => {
                 let client = &store.application.worker.client;
-                let user_id = store.application.settings.profile.user_id.clone();
+                let user_id = store.application.settings.user_id.clone();
                 let account = client.account();
                 let value = account
                     .fetch_profile_field_of(user_id, field.clone())
@@ -1090,7 +1102,7 @@ async fn login_normal(
     settings: &ApplicationSettings,
     store: &AsyncProgramStore,
 ) -> IambResult<()> {
-    println!("* Logging in for {}...", settings.profile.user_id);
+    println!("* Logging in for {}...", settings.user_id);
     login(worker, settings).await?;
     println!("* Syncing...");
     worker.spawn_sync()?;

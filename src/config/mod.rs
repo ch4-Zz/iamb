@@ -1,5 +1,6 @@
 //! # Logic for loading and validating application configuration
-use std::collections::HashSet;
+use std::collections::btree_map;
+use std::collections::{HashSet, hash_map};
 use std::env;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write as _};
@@ -7,6 +8,8 @@ use std::process;
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use chrono::format::{Item, StrftimeItems};
+use chrono::{DateTime, Local};
 use clap::Parser;
 use indexmap::IndexMap;
 use lazy_static::lazy_static;
@@ -39,6 +42,16 @@ macro_rules! usage {
         println!($($args)*);
         process::exit(2);
     }
+}
+
+macro_rules! merge_options {
+    ($a: expr, $b: expr) => {
+        match ($a, $b) {
+            (None, None) => None,
+            (Some(v), None) | (None, Some(v)) => Some(v),
+            (Some(a), Some(b)) => Some(a.merge(b)),
+        }
+    };
 }
 
 lazy_static! {
@@ -89,6 +102,37 @@ const DEFAULT_ICON_UNENC: Cow<'static, str> = Cow::Borrowed("[U] ");
 const DEFAULT_ICON_UNKNOWN: Cow<'static, str> = Cow::Borrowed("[?] ");
 
 const DEFAULT_LOG_LEVEL: &str = "off";
+
+/// Default date separator, matching the historical hard-coded `"%A, %B %d %Y"`.
+const DEFAULT_DATE_FORMAT: &str = "%A, %B %d %Y";
+
+/// Default time gutter, preserving the historical `  [HH:MM:SS]` rendering.
+const DEFAULT_TIME_FORMAT: &str = "  [%T]";
+
+/// Unix seconds of the timestamp used to measure time-gutter width.
+///
+/// 2024-01-17 13:25:30 UTC, so numeric fields have their usual widths.
+const TIME_GUTTER_SAMPLE_UNIX: i64 = 1_705_497_930;
+
+fn time_gutter_sample() -> DateTime<Local> {
+    DateTime::from_timestamp(TIME_GUTTER_SAMPLE_UNIX, 0)
+        .unwrap_or_default()
+        .with_timezone(&Local)
+}
+
+/// Display columns reserved for the per-message time gutter.
+///
+/// The width is the display width of `format` applied to one fixed sample
+/// timestamp, so a configuration keeps a constant column. An empty format
+/// reserves nothing and hides the time.
+pub fn time_gutter_width(format: &str) -> usize {
+    if format.is_empty() {
+        return 0;
+    }
+
+    let rendered = time_gutter_sample().format(format).to_string();
+    UnicodeWidthStr::width(rendered.as_str())
+}
 
 fn is_profile_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '.' || c == '-'
@@ -170,6 +214,21 @@ where
     Ok(Some(r))
 }
 
+fn deserialize_strftime<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+
+    // `DelayedFormat`'s `Display` impl returns `fmt::Error` for a bad specifier,
+    // and `.to_string()` then panics. Reject those strings while loading config.
+    if StrftimeItems::new(&value).any(|item| matches!(item, Item::Error)) {
+        return Err(D::Error::custom(format!("invalid strftime format string: {value:?}")));
+    }
+
+    Ok(Some(value))
+}
+
 /// Load themes from disk, and merge in the configured overrides.
 fn load_themes(
     themes_dir: &Path,
@@ -177,11 +236,26 @@ fn load_themes(
 ) -> anyhow::Result<CompletionMap<String, theme::Theme>> {
     let mut themes = CompletionMap::default();
 
-    // Load from the `themes` directory in the user's configuration directory:
-    theme::find_themes(themes_dir)?.into_iter().for_each(|(n, t)| {
+    let mut insert = |n, t| {
         let theme = theme_overrides.clone().merge(t).merge(theme::default_theme());
         themes.insert(n, theme);
-    });
+    };
+
+    let mut load_dir = |d: &Path| -> anyhow::Result<()> {
+        theme::find_themes(d)?.into_iter().for_each(|(n, t)| insert(n, t));
+        Ok(())
+    };
+
+    // Load themes from the shared directory first for systems with XDG_DATA_DIRS:
+    #[cfg(any(unix, target_os = "redox"))]
+    xdg::BaseDirectories::new()
+        .get_data_dirs()
+        .into_iter()
+        .map(|p| p.join("iamb/themes"))
+        .try_for_each(|p| load_dir(&p))?;
+
+    // Load from the `themes` directory in the user's configuration directory:
+    load_dir(themes_dir)?;
 
     // Insert a default theme that defaults to using terminal colors:
     let default_theme = theme_overrides.clone().merge(theme::default_theme());
@@ -189,13 +263,88 @@ fn load_themes(
     Ok(themes)
 }
 
-const VERSION: &str = match option_env!("VERGEN_GIT_SHA") {
-    None => env!("CARGO_PKG_VERSION"),
-    Some(_) => concat!(env!("CARGO_PKG_VERSION"), " (", env!("VERGEN_GIT_SHA"), ")"),
-};
+/// This must be called before the alternate screen is entered
+fn load_config_includes(mut config: IambConfig, config_dir: &Path) -> IambConfig {
+    for include in std::mem::take(&mut config.include) {
+        let expanded = shellexpand::full(&include)
+            .unwrap_or_else(|err| panic!("unable to expand shell variables in include: {err}"));
+
+        let path = config_dir.join(&*expanded);
+
+        if path.is_dir() {
+            let dir = match path.read_dir() {
+                Ok(dir) => dir,
+                Err(e) => {
+                    eprintln!("Unable to read config files in {path:?}: {e}");
+                    continue;
+                },
+            };
+
+            // get paths in lexicographic order
+            let mut paths: Vec<_> = dir
+                .flat_map(|entry| {
+                    match entry {
+                        Ok(file) => Some(file),
+                        Err(e) => {
+                            eprintln!("Unable to read config file in {path:?}: {e}");
+                            None
+                        },
+                    }
+                })
+                .collect();
+            paths.sort_unstable_by_key(|file| file.file_name());
+
+            for file in paths {
+                let path = file.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                    continue;
+                }
+
+                match IambConfig::load_toml(&path) {
+                    Ok(include) => {
+                        if !include.include.is_empty() {
+                            eprintln!("Ignoring nested includes in {path:?}");
+                        }
+                        config = include.merge(config);
+                    },
+                    Err(e) => {
+                        eprintln!("Unable to load config file in {path:?}: {e}");
+                    },
+                };
+            }
+        } else {
+            match IambConfig::load_toml(&path) {
+                Ok(include) => {
+                    if !include.include.is_empty() {
+                        eprintln!("Ignoring nested includes in {path:?}");
+                    }
+                    config = include.merge(config);
+                },
+                Err(e) => {
+                    eprintln!("Unable to load config file in {path:?}: {e}");
+                },
+            };
+        }
+    }
+
+    config
+}
+
+struct IambVersion;
+
+impl From<IambVersion> for clap::builder::Str {
+    fn from(_: IambVersion) -> Self {
+        let version: Cow<'static, str> = match option_env!("VERGEN_GIT_SHA") {
+            None => env!("CARGO_PKG_VERSION").into(),
+            Some(sha) => format!("{} ({sha})", env!("CARGO_PKG_VERSION")).into(),
+        };
+
+        version.into()
+    }
+}
 
 #[derive(Parser)]
-#[clap(version = VERSION, about, long_about = None)]
+#[clap(version = IambVersion, about, long_about = None)]
 #[clap(propagate_version = true)]
 pub struct Iamb {
     #[clap(long, value_parser)]
@@ -419,6 +568,46 @@ pub struct UserDisplayTunables {
 
 pub type UserOverrides = HashMap<OwnedUserId, UserDisplayTunables>;
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Hash)]
+#[serde(untagged)]
+pub enum RoomOverrideKey {
+    User(OwnedUserId),
+    Room(OwnedRoomId),
+    Alias(OwnedRoomAliasId),
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct RoomOverrideTunables {
+    pub name: Option<String>,
+}
+
+pub type RoomOverrides = HashMap<RoomOverrideKey, RoomOverrideTunables>;
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+pub struct RoomOverrideValues {
+    pub rooms: HashMap<OwnedRoomId, RoomOverrideTunables>,
+    pub aliases: HashMap<OwnedRoomAliasId, RoomOverrideTunables>,
+    pub dms: HashMap<OwnedUserId, RoomOverrideTunables>,
+}
+
+impl From<RoomOverrides> for RoomOverrideValues {
+    fn from(value: RoomOverrides) -> Self {
+        let mut rooms = HashMap::new();
+        let mut aliases = HashMap::new();
+        let mut dms = HashMap::new();
+
+        for (key, value) in value {
+            match key {
+                RoomOverrideKey::User(user_id) => dms.insert(user_id, value),
+                RoomOverrideKey::Room(room_id) => rooms.insert(room_id, value),
+                RoomOverrideKey::Alias(alias_id) => aliases.insert(alias_id, value),
+            };
+        }
+
+        Self { rooms, aliases, dms }
+    }
+}
+
 fn merge_maps<M, K, V>(profile: Option<M>, global: Option<M>) -> Option<M>
 where
     M: Extend<(K, V)> + IntoIterator<Item = (K, V)>,
@@ -427,6 +616,27 @@ where
         (Some(m), None) | (None, Some(m)) => Some(m),
         (Some(mut global), Some(profile)) => {
             global.extend(profile);
+            Some(global)
+        },
+        (None, None) => None,
+    }
+}
+
+fn merge_macros(profile: Option<Macros>, global: Option<Macros>) -> Option<Macros> {
+    match (global, profile) {
+        (Some(m), None) | (None, Some(m)) => Some(m),
+        (Some(mut global), Some(profile)) => {
+            for (mode, macros) in profile {
+                match global.entry(mode) {
+                    hash_map::Entry::Vacant(entry) => {
+                        entry.insert(macros);
+                    },
+                    hash_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().extend(macros);
+                    },
+                }
+            }
+
             Some(global)
         },
         (None, None) => None,
@@ -963,6 +1173,7 @@ pub struct TunableValues {
     pub typing_notice_send: bool,
     pub typing_notice_display: bool,
     pub users: UserOverrides,
+    pub rooms: RoomOverrideValues,
     pub username_display: UserDisplayStyle,
     pub message_user_color: bool,
     pub default_register: Option<Register>,
@@ -982,6 +1193,11 @@ pub struct TunableValues {
     pub ssl_verify: bool,
     pub cache_policy: MediaRetentionPolicy,
     pub send_on_enter: bool,
+    pub date_format: String,
+    pub time_format: String,
+    /// Display columns reserved for the time gutter, computed from
+    /// `time_format` once when the settings are loaded.
+    pub time_gutter_width: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1007,6 +1223,7 @@ pub struct Tunables {
 
     /// Subsection for overriding how specific Matrix users are rendered.
     pub users: Option<UserOverrides>,
+    pub rooms: Option<RoomOverrides>,
 
     pub default_markup: Option<MarkupFormat>,
     pub ignorecase: Option<bool>,
@@ -1046,6 +1263,13 @@ pub struct Tunables {
     pub ssl_verify: Option<bool>,
     pub cache_policy: Option<MediaRetentionPolicy>,
     pub send_on_enter: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_strftime")]
+    pub date_format: Option<String>,
+    /// strftime string for the per-message time gutter, including any brackets
+    /// or spacing. The column is as wide as a sample rendering of this string.
+    /// An empty string hides the time.
+    #[serde(default, deserialize_with = "deserialize_strftime")]
+    pub time_format: Option<String>,
 }
 
 impl Tunables {
@@ -1056,6 +1280,7 @@ impl Tunables {
             terminal: Terminal::merge(self.terminal, other.terminal),
             list_colors: ListColors::merge(self.list_colors, other.list_colors),
             users: merge_maps(self.users, other.users),
+            rooms: merge_maps(self.rooms, other.rooms),
 
             // Proxy configuration sub-field do *not* get merged, so that a
             // per-profile override won't inherit auth or headers from the
@@ -1107,10 +1332,15 @@ impl Tunables {
             ssl_verify: self.ssl_verify.or(other.ssl_verify),
             cache_policy: self.cache_policy.or(other.cache_policy),
             send_on_enter: self.send_on_enter.or(other.send_on_enter),
+            date_format: self.date_format.or(other.date_format),
+            time_format: self.time_format.or(other.time_format),
         }
     }
 
     fn values(self) -> TunableValues {
+        let time_format = self.time_format.unwrap_or_else(|| DEFAULT_TIME_FORMAT.to_owned());
+        let time_gutter_width = time_gutter_width(&time_format);
+
         TunableValues {
             encryption: self.encryption.values(),
             proxy: self.proxy.unwrap_or_default().values(),
@@ -1118,6 +1348,7 @@ impl Tunables {
             terminal: self.terminal.values(),
             list_colors: self.list_colors.values(),
             users: self.users.unwrap_or_default(),
+            rooms: self.rooms.unwrap_or_default().into(),
 
             default_markup: self.default_markup.unwrap_or_default(),
             log_level: self.log_level.unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_owned()),
@@ -1162,6 +1393,9 @@ impl Tunables {
             ssl_verify: self.ssl_verify.unwrap_or(true),
             cache_policy: self.cache_policy.unwrap_or_default(),
             send_on_enter: self.send_on_enter.unwrap_or(true),
+            date_format: self.date_format.unwrap_or_else(|| DEFAULT_DATE_FORMAT.to_owned()),
+            time_format,
+            time_gutter_width,
         }
     }
 }
@@ -1331,9 +1565,9 @@ pub enum Layout {
     Config { tabs: Vec<WindowLayout> },
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Default, Clone, Deserialize)]
 pub struct ProfileConfig {
-    pub user_id: OwnedUserId,
+    pub user_id: Option<OwnedUserId>,
     pub password_file: Option<PathBuf>,
     pub url: Option<Url>,
     pub settings: Option<Tunables>,
@@ -1344,8 +1578,38 @@ pub struct ProfileConfig {
     pub aliases: Option<Aliases>,
 }
 
+impl ProfileConfig {
+    fn merge(self, other: Self) -> Self {
+        let user_id = self.user_id.or(other.user_id);
+        let password_file = self.password_file.or(other.password_file);
+        let url = self.url.or(other.url);
+        let settings = merge_options!(self.settings, other.settings);
+        let theme = merge_options!(self.theme, other.theme);
+        let dirs = merge_options!(self.dirs, other.dirs);
+        let layout = self.layout.or(other.layout);
+        let macros = merge_macros(self.macros, other.macros);
+        let aliases = merge_maps(self.aliases, other.aliases);
+
+        Self {
+            user_id,
+            password_file,
+            url,
+            settings,
+            theme,
+            dirs,
+            layout,
+            macros,
+            aliases,
+        }
+    }
+}
+
 #[derive(Clone, Deserialize)]
 pub struct IambConfig {
+    #[serde(default)]
+    include: Vec<String>,
+
+    #[serde(default)]
     pub profiles: BTreeMap<String, ProfileConfig>,
     pub default_profile: Option<String>,
     pub settings: Option<Tunables>,
@@ -1370,6 +1634,45 @@ impl IambConfig {
 
         Ok(config)
     }
+
+    /// If a value is present in both configs, `self` is prefered.
+    fn merge(self, other: Self) -> Self {
+        // transitive includes are not supported
+        let include = vec![];
+
+        let mut profiles = self.profiles;
+        for (name, profile) in other.profiles {
+            match profiles.entry(name) {
+                btree_map::Entry::Vacant(entry) => {
+                    entry.insert(profile);
+                },
+                btree_map::Entry::Occupied(mut entry) => {
+                    let profile = std::mem::take(entry.get_mut()).merge(profile);
+                    entry.insert(profile);
+                },
+            }
+        }
+
+        let default_profile = self.default_profile.or(other.default_profile);
+        let settings = merge_options!(self.settings, other.settings);
+        let dirs = merge_options!(self.dirs, other.dirs);
+        let layout = self.layout.or(other.layout);
+        let macros = merge_macros(self.macros, other.macros);
+        let aliases = merge_maps(self.aliases, other.aliases);
+        let theme = merge_options!(self.theme, other.theme);
+
+        Self {
+            include,
+            profiles,
+            default_profile,
+            settings,
+            dirs,
+            layout,
+            macros,
+            aliases,
+            theme,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1382,6 +1685,7 @@ pub struct ApplicationSettings {
     pub sqlite_dir: PathBuf,
     pub sqlite_cache_dir: PathBuf,
     pub profile_name: String,
+    pub user_id: OwnedUserId,
     pub profile: ProfileConfig,
     pub theme: Arc<theme::ThemeValues>,
     pub themes: Arc<CompletionMap<String, theme::Theme>>,
@@ -1431,6 +1735,8 @@ impl ApplicationSettings {
             );
         };
 
+        let config = load_config_includes(config, &config_dir);
+
         let IambConfig {
             mut profiles,
             default_profile,
@@ -1440,6 +1746,7 @@ impl ApplicationSettings {
             macros,
             aliases,
             theme,
+            ..
         } = config;
 
         validate_profile_names(&profiles);
@@ -1481,8 +1788,10 @@ impl ApplicationSettings {
             }
         };
 
+        let user_id = profile.user_id.clone().expect("Active profile does not have a user id");
+
         let aliases = merge_maps(profile.aliases.take(), aliases).unwrap_or_default();
-        let macros = merge_maps(profile.macros.take(), macros).unwrap_or_default();
+        let macros = merge_macros(profile.macros.take(), macros).unwrap_or_default();
         let layout = profile.layout.take().or(layout).unwrap_or_default();
 
         let tunables = global.unwrap_or_default();
@@ -1555,6 +1864,7 @@ impl ApplicationSettings {
             sqlite_dir,
             sqlite_cache_dir,
             profile_name,
+            user_id,
             profile,
             themes,
             theme,
@@ -1611,7 +1921,7 @@ impl ApplicationSettings {
         let reader = BufReader::new(file);
         let saved: SavedDevice = serde_json::from_reader(reader).ok()?;
 
-        if saved.is_user(&self.profile.user_id) {
+        if saved.is_user(&self.user_id) {
             Some(saved)
         } else {
             None
@@ -1629,14 +1939,14 @@ impl ApplicationSettings {
         let saved = match client_id {
             Some(client) => {
                 SavedDevice::OAuth {
-                    user_id: self.profile.user_id.clone(),
+                    user_id: self.user_id.clone(),
                     device_id: device_id.to_owned(),
                     client_id: client,
                 }
             },
             None => {
                 SavedDevice::MatrixAuth {
-                    user_id: self.profile.user_id.clone(),
+                    user_id: self.user_id.clone(),
                     device_id: device_id.to_owned(),
                 }
             },
@@ -1652,7 +1962,12 @@ impl ApplicationSettings {
         let c = name
             .as_deref()
             .and_then(|name| name.chars().next())
-            .or_else(|| info.display_names.get(user_id).and_then(|name| name.chars().next()))
+            .or_else(|| {
+                info.display_names
+                    .get(user_id)
+                    .and_then(|name| name.chars().next())
+                    .filter(char::is_ascii)
+            })
             .unwrap_or_else(|| user_id.localpart().chars().next().unwrap_or(' '));
 
         Span::styled(String::from(c), style)
@@ -1682,7 +1997,11 @@ impl ApplicationSettings {
         self.theme.users.style(user_id.as_str(), color)
     }
 
-    pub fn get_user_span<'a>(&self, user_id: &'a UserId, info: &'a RoomInfo) -> Span<'a> {
+    pub fn get_user_span_maybe<'a>(
+        &self,
+        user_id: &'a UserId,
+        info: Option<&'a RoomInfo>,
+    ) -> Span<'a> {
         let (color, name) = self.get_user_overrides(user_id);
 
         let style = self.theme.users.style(user_id.as_str(), color);
@@ -1691,7 +2010,7 @@ impl ApplicationSettings {
             (None, UserDisplayStyle::Username) => Cow::Borrowed(user_id.as_str()),
             (None, UserDisplayStyle::LocalPart) => Cow::Borrowed(user_id.localpart()),
             (None, UserDisplayStyle::DisplayName) => {
-                if let Some(name) = info.display_names.get(user_id) {
+                if let Some(name) = info.and_then(|info| info.display_names.get(user_id)) {
                     name
                 } else {
                     Cow::Borrowed(user_id.as_str())
@@ -1700,6 +2019,10 @@ impl ApplicationSettings {
         };
 
         Span::styled(name, style)
+    }
+
+    pub fn get_user_span<'a>(&self, user_id: &'a UserId, info: &'a RoomInfo) -> Span<'a> {
+        self.get_user_span_maybe(user_id, Some(info))
     }
 }
 
@@ -1899,6 +2222,91 @@ mod tests {
         .unwrap();
         let users = vec![(user_id!("@a:b.c").to_owned(), expect(Color::Rgb(0xff, 0x55, 0xbb)))];
         assert_eq!(res.users, Some(users.into_iter().collect()));
+    }
+
+    fn parse_settings_toml(input: &str) -> Result<Tunables, toml::de::Error> {
+        #[derive(Deserialize)]
+        struct SettingsToml {
+            settings: Tunables,
+        }
+
+        toml::from_str::<SettingsToml>(input).map(|doc| doc.settings)
+    }
+
+    #[test]
+    fn test_parse_tunables_date_time_format() {
+        let settings = parse_settings_toml(
+            r#"
+[settings]
+date_format = "%Y-%m-%d"
+time_format = "%H:%M"
+"#,
+        )
+        .unwrap();
+        assert_eq!(settings.date_format.as_deref(), Some("%Y-%m-%d"));
+        assert_eq!(settings.time_format.as_deref(), Some("%H:%M"));
+
+        let values = settings.values();
+        assert_eq!(values.date_format, "%Y-%m-%d");
+        assert_eq!(values.time_format, "%H:%M");
+        assert_eq!(values.time_gutter_width, 5);
+
+        // Absent keys keep today's formats.
+        let settings = parse_settings_toml("[settings]\n").unwrap();
+        assert_eq!(settings.date_format, None);
+        assert_eq!(settings.time_format, None);
+        let values = settings.values();
+        assert_eq!(values.date_format, "%A, %B %d %Y");
+        assert_eq!(values.time_format, "  [%T]");
+        assert_eq!(values.time_gutter_width, 12);
+
+        // An empty format is valid and disables the time column.
+        let settings = parse_settings_toml(
+            r#"
+[settings]
+time_format = ""
+"#,
+        )
+        .unwrap();
+        assert_eq!(settings.time_format.as_deref(), Some(""));
+        let values = settings.values();
+        assert_eq!(values.time_format, "");
+        assert_eq!(values.time_gutter_width, 0);
+
+        // Brackets and spacing are literal gutter text, not added later.
+        let settings = parse_settings_toml(
+            r#"
+[settings]
+time_format = "  [%H:%M]"
+"#,
+        )
+        .unwrap();
+        let values = settings.values();
+        assert_eq!(values.time_format, "  [%H:%M]");
+        assert_eq!(values.time_gutter_width, 9);
+    }
+
+    #[test]
+    fn test_parse_tunables_date_time_format_invalid() {
+        let err = parse_settings_toml(
+            r#"
+[settings]
+date_format = "%Q"
+"#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid strftime"), "{msg}");
+
+        let err = parse_settings_toml(
+            r#"
+[settings]
+time_format = "%"
+"#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid strftime"), "{msg}");
     }
 
     #[test]
@@ -2240,6 +2648,7 @@ mod tests {
             macros,
             aliases,
             theme,
+            ..
         } = &config;
 
         // There should be an example object for each top-level field.

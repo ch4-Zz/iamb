@@ -3,6 +3,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use anyhow::Context;
+use palette::Hsl;
 use ratatui::widgets::BorderType;
 use serde::de::Error as SerdeError;
 use serde::de::Visitor;
@@ -12,12 +13,13 @@ use crate::prelude::*;
 
 pub fn default_theme() -> Theme {
     Theme {
+        selected: Stylable::with_modifiers(StyleModifier::REVERSED),
         messages: ThemeMessages {
             blockquote: LineStylable {
                 line: Some(LineName::Thick),
-                stylable: Stylable::fg(Color::Indexed(236)),
+                stylable: Stylable::fg(Color::Cyan),
             },
-            code: Stylable::bg(Color::Indexed(236)),
+            code: Stylable::fg(Color::Cyan),
             code_block: LineStylable {
                 line: Some(LineName::Plain),
                 stylable: Stylable::default(),
@@ -59,6 +61,10 @@ pub fn default_theme() -> Theme {
                 modifiers: vec![ModifierChange::Remove(StyleModifier::REVERSED)],
             },
         },
+        cmdbar: ThemeCommandBar {
+            error: Stylable::fg(Color::Red),
+            ..Default::default()
+        },
         timeline: ThemeTimeline {
             date: Stylable::with_modifiers(StyleModifier::BOLD),
             unread_marker: Stylable::with_modifiers(StyleModifier::DIM),
@@ -66,6 +72,7 @@ pub fn default_theme() -> Theme {
         },
         rooms: ThemeRooms {
             unread: ThemeRoomsUnreads {
+                name: Stylable::fg(Color::Cyan),
                 number: Stylable::fg(Color::Gray),
                 ..Default::default()
             },
@@ -89,7 +96,7 @@ pub fn default_theme() -> Theme {
         users: ThemeUsers {
             // Green and LightGreen stay out of the hash pool. The local profile
             // pins its own user to green through settings.users.
-            colors: Some(vec![
+            colors: Some(UserColors::Palette(vec![
                 Color::Blue,
                 Color::Cyan,
                 Color::LightBlue,
@@ -101,7 +108,7 @@ pub fn default_theme() -> Theme {
                 Color::Red,
                 Color::Reset,
                 Color::Yellow,
-            ]),
+            ])),
             stylable: Stylable::with_modifiers(StyleModifier::BOLD),
         },
         ..Default::default()
@@ -109,8 +116,10 @@ pub fn default_theme() -> Theme {
 }
 
 pub fn find_themes(dir: &Path) -> anyhow::Result<Vec<(String, Theme)>> {
-    let entries = std::fs::read_dir(dir)
-        .with_context(|| format!("Cannot list {} contents", dir.display()))?;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(vec![]);
+    };
+
     let mut themes = vec![];
 
     for res in entries {
@@ -134,9 +143,15 @@ pub fn find_themes(dir: &Path) -> anyhow::Result<Vec<(String, Theme)>> {
             continue;
         };
 
-        let file = ThemeFile::load(&path)?;
-        let name = name.to_string_lossy().into_owned();
-        themes.push((name, file.theme));
+        match ThemeFile::load(&path) {
+            Ok(file) => {
+                let name = name.to_string_lossy().into_owned();
+                themes.push((name, file.theme));
+            },
+            Err(err) => {
+                tracing::error!(?err, "failed to load theme file at {}", path.display());
+            },
+        };
     }
 
     Ok(themes)
@@ -287,14 +302,6 @@ struct Stylable {
 }
 
 impl Stylable {
-    fn bg(c: Color) -> Self {
-        Self {
-            background: Some(c),
-            color: None,
-            modifiers: vec![],
-        }
-    }
-
     fn fg(c: Color) -> Self {
         Self {
             background: None,
@@ -377,6 +384,10 @@ pub struct Theme {
     #[serde(default)]
     default: Stylable,
 
+    /// Default styling to layer on top of selected list items.
+    #[serde(default)]
+    selected: Stylable,
+
     /// Configuration for styling the command bar.
     #[serde(default)]
     cmdbar: ThemeCommandBar,
@@ -422,6 +433,7 @@ impl Theme {
     pub fn merge(self, other: Self) -> Self {
         Self {
             default: self.default.merge(other.default),
+            selected: self.selected.merge(other.selected),
             cmdbar: self.cmdbar.merge(other.cmdbar),
             encryption: self.encryption.merge(other.encryption),
             msgbar: self.msgbar.merge(other.msgbar),
@@ -440,6 +452,7 @@ impl Theme {
 
         ThemeValues {
             default: base,
+            selected: Style::from(self.selected),
             cmdbar: self.cmdbar.values(base),
             encryption: self.encryption.values(base),
             msgbar: self.msgbar.values(base),
@@ -458,6 +471,9 @@ impl Theme {
 pub struct ThemeValues {
     /// Styling to use when nothing more specific applies.
     pub default: Style,
+
+    /// Styling to patch on top of selected list items.
+    pub selected: Style,
 
     /// Styling for the command bar.
     pub cmdbar: ThemeCommandBarValues,
@@ -488,6 +504,16 @@ pub struct ThemeValues {
 
     /// Styling for the completion menu.
     pub completion: ThemeCompletionValues,
+}
+
+impl ThemeValues {
+    pub fn selected(&self, style: Style, selected: bool) -> Style {
+        if selected {
+            style.patch(self.selected)
+        } else {
+            style
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -630,10 +656,13 @@ impl ThemeRooms {
     fn values(self, base: Style) -> ThemeRoomsValues {
         let default = base.patch(self.default);
         let labels = default.patch(self.labels);
-        let unread = self.unread.values(default, labels);
-        let notification = self.notification.values(default, labels);
-        let mention = self.mention.values(default, labels);
-        let marked_unread = self.marked_unread.values(default, labels);
+
+        // Apply any inherited unread styling to the more specific notification types:
+        let unread = self.unread;
+        let notification = self.notification.merge(unread.clone()).values(default, labels);
+        let mention = self.mention.merge(unread.clone()).values(default, labels);
+        let marked_unread = self.marked_unread.merge(unread.clone()).values(default, labels);
+        let unread = unread.values(default, labels);
 
         ThemeRoomsValues {
             default,
@@ -1013,8 +1042,60 @@ pub struct ThemeWindowsValues {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum UserColors {
+    RainbowDark,
+    RainbowLight,
+    #[default]
+    #[serde(skip)]
+    Unset,
+    #[serde(untagged)]
+    Palette(Vec<Color>),
+}
+
+impl UserColors {
+    fn hash(user_id: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        user_id.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn hash_to_color(hash: f64, l_base: f64) -> Color {
+        let h = hash % 360.0;
+        let s = hash % 60.0 + 40.0;
+        let l = hash % 35.0 + l_base;
+        let hsl: Hsl = Hsl::new(h as f32, s as f32 / 100.0, l as f32 / 100.0);
+        Color::from_hsl(hsl)
+    }
+
+    fn color(&self, user_id: &str) -> Option<Color> {
+        let color = match self {
+            Self::Unset => return None,
+            Self::Palette(colors) => {
+                if colors.is_empty() {
+                    return None;
+                } else {
+                    let hash = Self::hash(user_id) as usize;
+                    colors[hash % colors.len()]
+                }
+            },
+            Self::RainbowDark => {
+                let hash = Self::hash(user_id);
+                Self::hash_to_color(hash as f64, 15.0)
+            },
+            Self::RainbowLight => {
+                let hash = Self::hash(user_id);
+                Self::hash_to_color(hash as f64, 50.0)
+            },
+        };
+
+        Some(color)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
 struct ThemeUsers {
-    colors: Option<Vec<Color>>,
+    colors: Option<UserColors>,
     #[serde(flatten)]
     stylable: Stylable,
 }
@@ -1028,8 +1109,8 @@ impl ThemeUsers {
     }
 
     fn values(self, base: Style) -> ThemeUsersValues {
-        let colors = self.colors.unwrap_or_default();
         let style = base.patch(self.stylable);
+        let colors = self.colors.unwrap_or_default();
 
         ThemeUsersValues { colors, style }
     }
@@ -1037,20 +1118,13 @@ impl ThemeUsers {
 
 #[derive(Clone, Debug, Default)]
 pub struct ThemeUsersValues {
-    colors: Vec<Color>,
+    colors: UserColors,
     style: Style,
 }
 
 impl ThemeUsersValues {
     pub fn color(&self, user_id: &str) -> Color {
-        if self.colors.is_empty() {
-            return self.style.fg.unwrap_or(Color::Reset);
-        }
-
-        let mut hasher = DefaultHasher::new();
-        user_id.hash(&mut hasher);
-        let color = hasher.finish() as usize % self.colors.len();
-        self.colors[color]
+        self.colors.color(user_id).or(self.style.fg).unwrap_or(Color::Reset)
     }
 
     pub fn style(&self, user_id: &str, explicit: Option<Color>) -> Style {
@@ -1059,12 +1133,11 @@ impl ThemeUsersValues {
         if let Some(c) = explicit {
             // Use explicit color from config file:
             style.fg(c)
-        } else if self.colors.is_empty() {
-            // User has explicitly set an empty array:
-            style
+        } else if let Some(c) = self.colors.color(user_id) {
+            // Apply the user color we hashed to:
+            style.fg(c)
         } else {
-            // Hash on user ID to pick a color from the array:
-            style.fg(self.color(user_id))
+            style
         }
     }
 }
@@ -1078,7 +1151,9 @@ mod tests {
         // Green is reserved for the local user, pinned through settings.users.
         // If an upstream merge puts either shade back into the pool, fail here
         // rather than silently handing green to somebody else.
-        let colors = default_theme().users.colors.expect("default user palette");
+        let Some(UserColors::Palette(colors)) = default_theme().users.colors else {
+            panic!("default user palette");
+        };
         assert!(!colors.contains(&Color::Green));
         assert!(!colors.contains(&Color::LightGreen));
     }
@@ -1119,5 +1194,35 @@ mod tests {
 
         let res: LineName = serde_json::from_str(r#""double-dashed-heavy""#).unwrap();
         assert_eq!(res, LineName::DoubleDashedHeavy);
+    }
+
+    #[test]
+    fn test_load_packaged_themes() {
+        let dir = Path::new("themes");
+        let mut count = 0;
+
+        for entry in std::fs::read_dir(dir).expect("can read themes") {
+            let path = entry.expect("can read theme file").path();
+
+            if path.extension().is_none_or(|ext| ext != "toml") {
+                continue;
+            }
+
+            let file = ThemeFile::load(&path)
+                .with_context(|| format!("failed to parse {}", path.display()))
+                .expect("parsed theme");
+            assert!(file.theme.default.background.is_some());
+            assert!(file.theme.default.color.is_some());
+
+            count += 1;
+        }
+
+        // We don't hardcode the theme count so that adding new themes doesn't
+        // require updating this test every time, but we do check that we have
+        // seen enough that if something major changes (like renaming every
+        // file to no longer end in `.toml`) then we will notice and fix this
+        // test to account for it and continue asserting that the tests remain
+        // valid.
+        assert!(count > 40, "we should process >40 themes");
     }
 }

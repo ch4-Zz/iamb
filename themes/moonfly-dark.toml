@@ -8,9 +8,9 @@
 #
 # COLOR_BG1 => Primary background (#080808)
 # COLOR_BG2 => Alternate background (#1C1C1C)
-# COLOR_BG3 => Completion menu selected item background (#292929)
+# COLOR_BG3 => Completion menu text, drawn reversed over COLOR_UI1 (#292929)
 #
-# COLOR_UI1 => Window border color, text completion menu (#949494)
+# COLOR_UI1 => Window border color, completion menu background (#949494)
 # COLOR_UI2 => Window title color (#C6C6C6)
 #
 # COLOR_WARN1 => Errors, unencrypted, etc. - typically a red (#E65E72)
@@ -24,6 +24,7 @@
 # COLOR_TEXT3 => Alternate text color (#CF87E8)
 # COLOR_TEXT4 => Alternate text color (#80A0FF)
 # COLOR_TEXT5 => Alternate text color (#79DAC8)
+#
 #
 [theme.users]
 colors = [
@@ -58,8 +59,12 @@ strong.color = "#CF87E8"
 
 [theme.rooms]
 default.color = "#79DAC8"
-unread.color = "#74B2FF"
 labels.color = "#80A0FF"
+unread.name.color = "#74B2FF"
+unread.number.color = "#80A0FF"
+mention.number.color = "#E65E72"
+notification.number.color = "#C6C684"
+marked_unread.number.color = "#626262"
 
 [theme.windows]
 border.color = "#949494"

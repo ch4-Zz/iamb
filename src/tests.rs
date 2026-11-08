@@ -1,7 +1,9 @@
 use std::iter::FromIterator as _;
 
 use lazy_static::lazy_static;
+use matrix_sdk::ruma::events::room::member::MembershipState;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+use matrix_sdk::ruma::events::room::power_levels::UserPowerLevel;
 use matrix_sdk::ruma::{UInt, event_id, server_name, user_id};
 use matrix_sdk::ruma::{assign, owned_room_alias_id};
 use serde_json::{Map, Value};
@@ -135,6 +137,14 @@ pub fn mock_room() -> RoomInfo {
     let name = "User 2";
     room.display_names.set(user_id.clone(), Some(name.to_string()), true);
 
+    let member = MemberSummary {
+        user_id: user_id.clone(),
+        display_name: Some(name.to_string()),
+        power_level: UserPowerLevel::Int(50.into()),
+        membership: MembershipState::Join,
+    };
+    room.memberships.insert(user_id, member);
+
     room
 }
 
@@ -177,6 +187,7 @@ pub fn mock_tunables() -> TunableValues {
         theme: "default".into(),
         typing_notice_send: true,
         typing_notice_display: true,
+        rooms: Default::default(),
         users: vec![(TEST_USER5.clone(), UserDisplayTunables {
             color: Some(Color::Black),
             name: Some("USER 5".into()),
@@ -202,6 +213,9 @@ pub fn mock_tunables() -> TunableValues {
         ssl_verify: true,
         cache_policy: Default::default(),
         send_on_enter: true,
+        date_format: "%A, %B %d %Y".to_string(),
+        time_format: "  [%T]".to_string(),
+        time_gutter_width: 12,
     }
 }
 
@@ -216,8 +230,9 @@ pub fn mock_settings() -> ApplicationSettings {
         sqlite_cache_dir: PathBuf::new(),
 
         profile_name: "test".into(),
+        user_id: user_id!("@user:example.com").to_owned(),
         profile: ProfileConfig {
-            user_id: user_id!("@user:example.com").to_owned(),
+            user_id: Some(user_id!("@user:example.com").to_owned()),
             password_file: None,
             url: None,
             settings: None,

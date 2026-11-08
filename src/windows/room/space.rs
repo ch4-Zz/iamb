@@ -21,7 +21,7 @@ pub struct SpaceState {
 impl SpaceState {
     pub fn new(room: MatrixRoom) -> Self {
         let room_id = room.room_id().to_owned();
-        let content = IambBufferId::Room(room_id.clone(), None, RoomFocus::Scrollback);
+        let content = IambBufferId::Room(room_id.clone(), RoomView::Main, RoomFocus::Scrollback);
         let list = ListState::new(content, vec![]);
         let last_fetch = None;
 
@@ -66,7 +66,7 @@ impl SpaceState {
                     .map_err(matrix_sdk::Error::from)
                     .map_err(IambError::from)?
                     .user_can_send_state(
-                        &store.application.settings.profile.user_id,
+                        &store.application.settings.user_id,
                         StateEventType::SpaceChild,
                     )
                 {
@@ -117,7 +117,7 @@ impl SpaceState {
                     .map_err(matrix_sdk::Error::from)
                     .map_err(IambError::from)?
                     .user_can_send_state(
-                        &store.application.settings.profile.user_id,
+                        &store.application.settings.user_id,
                         StateEventType::SpaceChild,
                     )
                 {

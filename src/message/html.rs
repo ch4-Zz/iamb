@@ -27,6 +27,7 @@ use crate::util::{join_cell_text, space_text};
 pub struct BulletIterator {
     style: ListStyle,
     pos: usize,
+    /// The number of characters the number takes up
     len: usize,
 }
 
@@ -34,7 +35,7 @@ impl BulletIterator {
     fn width(&self) -> usize {
         match self.style {
             ListStyle::Unordered => 2,
-            ListStyle::Ordered => self.len.to_string().len() + 2,
+            ListStyle::Ordered(_) => self.len + 2,
         }
     }
 }
@@ -43,19 +44,15 @@ impl Iterator for BulletIterator {
     type Item = String;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos == self.len {
-            return None;
-        }
-
-        self.pos += 1;
-
         let bullet = match self.style {
             ListStyle::Unordered => "- ".to_string(),
-            ListStyle::Ordered => {
-                let w = self.len.to_string().len();
+            ListStyle::Ordered(_) => {
+                let w = self.len;
                 format!("{: >w$}. ", self.pos, w = w)
             },
         };
+
+        self.pos += 1;
 
         return Some(bullet);
     }
@@ -64,13 +61,21 @@ impl Iterator for BulletIterator {
 /// Whether this list is ordered or unordered.
 #[derive(Clone, Copy, Debug)]
 pub enum ListStyle {
-    Ordered,
+    /// The `usize` is the start index.
+    Ordered(usize),
     Unordered,
 }
 
 impl ListStyle {
     fn bullets(&self, len: usize) -> BulletIterator {
-        BulletIterator { style: *self, pos: 0, len }
+        let pos = match self {
+            Self::Ordered(start) => *start,
+            Self::Unordered => 0,
+        };
+
+        let len = (pos + len).to_string().len();
+
+        BulletIterator { style: *self, pos, len }
     }
 }
 
@@ -291,8 +296,8 @@ pub enum StyleTreeNode {
     Table(Table),
     Text(Cow<'static, str>),
     Sequence(StyleTreeChildren),
-    RoomAlias(OwnedRoomAliasId, Option<char>),
-    RoomId(OwnedRoomId, Vec<OwnedServerName>, Option<char>),
+    RoomAlias(OwnedRoomAliasId, Option<char>, Option<OwnedEventId>),
+    RoomId(OwnedRoomId, Vec<OwnedServerName>, Option<char>, Option<OwnedEventId>),
     UserId(OwnedUserId, Option<char>),
     DisplayName(String, OwnedUserId, Option<char>),
 }
@@ -342,17 +347,29 @@ impl StyleTreeNode {
                     urls.push((*c, to_url));
                 }
             },
-            StyleTreeNode::RoomId(room_id, via, c) => {
+            StyleTreeNode::RoomId(room_id, via, c, event_id) => {
                 if let Some(c) = c {
-                    let to_url =
-                        Url::parse(&room_id.matrix_uri_via(via.iter().cloned(), false).to_string())
-                            .unwrap();
+                    let uri = if let Some(ev_id) = event_id {
+                        room_id.matrix_event_uri(ev_id.to_owned()).to_string()
+                    } else {
+                        room_id.matrix_uri_via(via.iter().cloned(), false).to_string()
+                    };
+                    let to_url = Url::parse(&uri).unwrap();
                     urls.push((*c, to_url));
                 }
             },
-            StyleTreeNode::RoomAlias(alias, c) => {
+            StyleTreeNode::RoomAlias(alias, c, event_id) => {
                 if let Some(c) = c {
-                    let to_url = Url::parse(&alias.matrix_uri(false).to_string()).unwrap();
+                    let uri = if let Some(ev_id) = event_id {
+                        #[expect(
+                            deprecated,
+                            reason = "we only use this if we received a deprecated link"
+                        )]
+                        alias.matrix_event_uri(ev_id.to_owned()).to_string()
+                    } else {
+                        alias.matrix_uri(false).to_string()
+                    };
+                    let to_url = Url::parse(&uri).unwrap();
                     urls.push((*c, to_url));
                 }
             },
@@ -504,7 +521,23 @@ impl StyleTreeNode {
             },
             StyleTreeNode::Style(child, patch) => child.print(printer, style.patch(*patch)),
             StyleTreeNode::Sequence(children) => {
+                let mut after_quote = false;
+
                 for child in children {
+                    match child {
+                        // Whitespace between elements shouldn't affect spacing.
+                        StyleTreeNode::Text(text) if text.trim().is_empty() => {},
+                        StyleTreeNode::Blockquote(_) => {
+                            if after_quote {
+                                // Keep adjacent blockquotes from visually merging.
+                                printer.commit();
+                                printer.push_break();
+                            }
+                            after_quote = true;
+                        },
+                        _ => after_quote = false,
+                    }
+
                     child.print(printer, style);
                 }
             },
@@ -523,12 +556,18 @@ impl StyleTreeNode {
                 let style = printer.settings().get_user_style(user_id);
                 printer.push_str(display_name.as_str(), style);
             },
-            StyleTreeNode::RoomId(room_id, _, _) => {
+            StyleTreeNode::RoomId(room_id, _, _, event_id) => {
                 let bold = style.add_modifier(StyleModifier::BOLD);
+                if event_id.is_some() {
+                    printer.push_str("Event in ", bold);
+                }
                 printer.push_str(room_id.as_str(), bold);
             },
-            StyleTreeNode::RoomAlias(alias, _) => {
+            StyleTreeNode::RoomAlias(alias, _, event_id) => {
                 let bold = style.add_modifier(StyleModifier::BOLD);
+                if event_id.is_some() {
+                    printer.push_str("Event in ", bold);
+                }
                 printer.push_str(alias.as_str(), bold);
             },
         }
@@ -677,6 +716,20 @@ fn lic2t(handles: &[Handle], state: &mut TreeGenState) -> StyleTreeChildren {
     handles.iter().filter_map(|h| li2t(h, state)).collect()
 }
 
+fn attrs_to_start(attrs: &[Attribute]) -> Option<usize> {
+    for attr in attrs {
+        if attr.name.local.as_ref() != "start" {
+            continue;
+        }
+
+        if let Ok(start) = usize::from_str(attr.value.as_ref()) {
+            return Some(start);
+        }
+    }
+
+    return None;
+}
+
 fn attrs_to_alt(attrs: &[Attribute]) -> Option<String> {
     for attr in attrs {
         if attr.name.local.as_ref() != "alt" {
@@ -749,17 +802,20 @@ fn mxid2t(
     h: &Url,
 ) -> StyleTreeNode {
     match id {
-        MatrixId::Room(room_id) => StyleTreeNode::RoomId(room_id.to_owned(), via.to_owned(), n),
-        MatrixId::RoomAlias(alias) => StyleTreeNode::RoomAlias(alias.to_owned(), n),
+        MatrixId::Room(room_id) => {
+            StyleTreeNode::RoomId(room_id.to_owned(), via.to_owned(), n, None)
+        },
+        MatrixId::RoomAlias(alias) => StyleTreeNode::RoomAlias(alias.to_owned(), n, None),
         MatrixId::User(user_id) => StyleTreeNode::UserId(user_id.to_owned(), n),
-        MatrixId::Event(room_or_alias_id, _) => {
+        MatrixId::Event(room_or_alias_id, event_id) => {
             let room_or_alias_id: &matrix_sdk::ruma::RoomOrAliasId = room_or_alias_id;
-            // ignore event id for now
+            let event_id = Some(event_id.to_owned());
+
             if let Ok(alias_id) = <&matrix_sdk::ruma::RoomAliasId>::try_from(room_or_alias_id) {
-                StyleTreeNode::RoomAlias(alias_id.to_owned(), n)
+                StyleTreeNode::RoomAlias(alias_id.to_owned(), n, event_id)
             } else {
                 let room_id = <&matrix_sdk::ruma::RoomId>::try_from(room_or_alias_id).unwrap();
-                StyleTreeNode::RoomId(room_id.to_owned(), via.to_owned(), n)
+                StyleTreeNode::RoomId(room_id.to_owned(), via.to_owned(), n, event_id)
             }
         },
         _ => {
@@ -834,7 +890,10 @@ fn h2t(hdl: &Handle, state: &mut TreeGenState) -> StyleTreeChildren {
 
                 // Lists
                 "ol" => {
-                    StyleTreeNode::List(lic2t(&node.children.borrow(), state), ListStyle::Ordered)
+                    StyleTreeNode::List(
+                        lic2t(&node.children.borrow(), state),
+                        ListStyle::Ordered(attrs_to_start(&attrs.borrow()).unwrap_or(1)),
+                    )
                 },
                 "ul" => {
                     StyleTreeNode::List(lic2t(&node.children.borrow(), state), ListStyle::Unordered)
@@ -1157,7 +1216,7 @@ pub mod tests {
         let s = "<blockquote>Hello world!</blockquote>";
         let tree = parse_matrix_html(s);
         let text = tree.to_text(10, Style::default(), &settings, &info);
-        let style = Style::new().fg(Color::Indexed(236));
+        let style = Style::new().fg(Color::Cyan);
         assert_eq!(text.lines.len(), 2);
         assert_eq!(
             text.lines[0],
@@ -1181,6 +1240,29 @@ pub mod tests {
                 Span::raw(" "),
             ])
         );
+    }
+
+    #[test]
+    fn test_blockquote_adjacent() {
+        let info = mock_room();
+        let settings = mock_settings();
+        let s = "<blockquote>\n<p>One</p>\n</blockquote>\n<blockquote>\n<p>Two</p>\n</blockquote>";
+        let tree = parse_matrix_html(s);
+        let text = tree.to_text(10, Style::default(), &settings, &info);
+        let style = Style::new().fg(Color::Cyan);
+        let quoted = |word: &'static str, pad: &'static str| {
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(line::THICK_VERTICAL, style),
+                Span::raw(" "),
+                Span::raw(word),
+                Span::raw(pad),
+            ])
+        };
+        assert_eq!(text.lines.len(), 3);
+        assert_eq!(text.lines[0], quoted("One", "    "));
+        assert_eq!(text.lines[1], Line::from(vec![Span::raw(" ".repeat(10))]));
+        assert_eq!(text.lines[2], quoted("Two", "    "));
     }
 
     #[test]

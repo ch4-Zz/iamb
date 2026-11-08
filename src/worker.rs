@@ -92,7 +92,6 @@ use tracing::{Instrument as _, error, warn};
 
 use crate::base::{CreateRoomFlags, CreateRoomType, EchoLocation, MessageNeed};
 use crate::config::ProxyUrl;
-use crate::message::MessageId;
 use crate::notifications::register_notifications;
 use crate::oauth::oauth_login;
 use crate::prelude::*;
@@ -243,7 +242,7 @@ async fn load_plans(store: &AsyncProgramStore) -> Vec<Plan> {
         plan.push(Plan::RoomPreview(room));
     }
 
-    for (room_id, need) in std::mem::take(need_load).into_iter() {
+    for (room_id, need) in need_load.room_needs() {
         if need.pinned {
             let missing = rooms.get_or_default(room_id.clone()).missing_pinned();
 
@@ -511,10 +510,10 @@ fn insert_msgs_and_receipts(
                 // ignoring redaction events because we get them bundled with the redacted event
             },
             AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::PollStart(ev)) => {
-                info.insert_poll_start(ev);
+                info.insert_poll_start(ev, &settings.user_id);
             },
             AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::UnstablePollStart(ev)) => {
-                info.insert_unstable_poll_start(ev);
+                info.insert_unstable_poll_start(ev, &settings.user_id);
             },
             AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::PollResponse(ev)) => {
                 if let MessageLikeEvent::Original(ev) = ev {
@@ -602,15 +601,30 @@ async fn load_older(client: &Client, store: &AsyncProgramStore) -> usize {
         .await
 }
 
-async fn members_load(client: &Client, room_id: &RoomId) -> IambResult<Vec<RoomMember>> {
-    if let Some(room) = client.get_room(room_id) {
-        Ok(room
-            .members_no_sync(RoomMemberships::all())
-            .await
-            .map_err(IambError::from)?)
-    } else {
-        Err(IambError::UnknownRoom(room_id.to_owned()).into())
+fn member_summary(member: &RoomMember) -> MemberSummary {
+    MemberSummary {
+        user_id: member.user_id().to_owned(),
+        display_name: member.display_name().map(ToOwned::to_owned),
+        power_level: member.power_level(),
+        membership: member.membership().clone(),
     }
+}
+
+/// Fetch all known members of the room regardless of current `MembershipState`.
+async fn members_load(client: &Client, room_id: &RoomId) -> IambResult<Vec<MemberSummary>> {
+    let Some(room) = client.get_room(room_id) else {
+        return Err(IambError::UnknownRoom(room_id.to_owned()).into());
+    };
+
+    let members = room
+        .members(RoomMemberships::all())
+        .await
+        .map_err(IambError::from)?
+        .iter()
+        .map(member_summary)
+        .collect();
+
+    Ok(members)
 }
 
 fn member_active(state: &MembershipState) -> bool {
@@ -619,7 +633,7 @@ fn member_active(state: &MembershipState) -> bool {
 
 fn members_insert(
     room_id: OwnedRoomId,
-    res: IambResult<Vec<RoomMember>>,
+    res: IambResult<Vec<MemberSummary>>,
     store: &mut ProgramStore,
 ) {
     if let Ok(members) = res {
@@ -627,11 +641,12 @@ fn members_insert(
         let info = rooms.get_or_default(room_id);
 
         for member in members {
-            let user_id = member.user_id().to_owned();
-            let name = member.display_name().map(|s| s.to_owned());
-            let is_active = member_active(member.membership());
-
-            info.display_names.set(user_id, name, is_active);
+            info.display_names.set(
+                member.user_id.clone(),
+                member.display_name.clone(),
+                member.is_active(),
+            );
+            info.memberships.insert(member.user_id.clone(), member);
         }
     }
     // else ???
@@ -715,9 +730,18 @@ async fn load_older_forever(client: &Client, store: &AsyncProgramStore) {
     // Load any pending older messages or members every 2 seconds.
     let mut interval = tokio::time::interval(Duration::from_secs(2));
 
+    let notifier = store.lock().await.application.need_load.notifier();
+
+    let mut notified = notifier.notified();
     loop {
-        interval.tick().await;
+        notified.await;
+
+        // get the next `Notified` future here to make sure we get notified about changes happening
+        // while `load_older` runs
+        notified = notifier.notified();
+
         load_older(client, store).await;
+        interval.tick().await;
     }
 }
 
@@ -759,7 +783,7 @@ async fn refresh_rooms(client: &Client, store: &AsyncProgramStore, first_sync: b
         }
 
         pinned.push((room.room_id().to_owned(), room.pinned_event_ids().unwrap_or_default()));
-        names_and_tags.push((room.room_id().to_owned(), name, tags, aliases, flags));
+        names_and_tags.push((room.clone(), name, tags, aliases, flags));
 
         if room.is_direct().await.unwrap_or_default() {
             dms.push(room);
@@ -771,12 +795,34 @@ async fn refresh_rooms(client: &Client, store: &AsyncProgramStore, first_sync: b
     }
 
     let mut locked = store.lock().await;
+
     locked.application.sync_info.spaces = spaces;
     locked.application.sync_info.rooms = rooms;
     locked.application.sync_info.dms = dms;
 
-    for (room_id, name, tags, aliases, flags) in names_and_tags {
+    for (room, mut name, tags, aliases, flags) in names_and_tags {
+        let room_id = room.room_id().to_owned();
+
+        let rooms = &locked.application.settings.tunables.rooms;
+        let room_override = rooms
+            .rooms
+            .get(&room_id)
+            .or_else(|| aliases.iter().find_map(|alias| rooms.aliases.get(alias)));
+        if let Some(name_override) = room_override.and_then(|v| v.name.as_ref()) {
+            name.clone_from(name_override);
+        }
+
         locked.application.set_room_info(room_id, name, tags, aliases, flags);
+    }
+
+    let ChatStore { rooms, settings, .. } = &mut locked.application;
+    for (user_id, room_override) in settings.tunables.rooms.dms.iter() {
+        if let Some(name) = &room_override.name &&
+            let Some(room) = client.get_dm_room(user_id) &&
+            let Some(info) = rooms.get_mut(room.room_id())
+        {
+            info.name = Some(name.to_owned());
+        }
     }
 
     for (room_id, pinned_events) in pinned {
@@ -952,6 +998,9 @@ async fn subscribe_sendqueue_forever(client: &Client, store: &AsyncProgramStore)
     }
 
     while let Ok(SendQueueUpdate { room_id, update }) = receiver.recv().await {
+        let span = tracing::info_span!("handle_sendqueue_update", ?room_id);
+        let _guard = span.enter();
+
         let mut locked = store.lock().await;
         let info = locked.application.get_room_info(room_id);
         match update {
@@ -962,10 +1011,12 @@ async fn subscribe_sendqueue_forever(client: &Client, store: &AsyncProgramStore)
                 let Some(EchoLocation::Message(thread, key)) =
                     info.echo_keys.get(&transaction_id).cloned()
                 else {
+                    tracing::debug!(?transaction_id, "replaced local echo location not found");
                     continue;
                 };
 
                 let Ok(content) = new_content.deserialize() else {
+                    tracing::warn!(?transaction_id, "unable to deserialize sendqueue replacement");
                     continue;
                 };
                 let AnyMessageLikeEventContent::RoomMessage(new_content) = content else {
@@ -974,10 +1025,12 @@ async fn subscribe_sendqueue_forever(client: &Client, store: &AsyncProgramStore)
                 };
 
                 let Some(msg) = info.get_thread_mut(thread).get_mut(&key) else {
+                    tracing::debug!(?transaction_id, "replaced local echo not found");
                     continue;
                 };
 
                 let MessageEvent::Local(_, _, msg) = &mut msg.event else {
+                    tracing::debug!(?transaction_id, "replaced message is not a local echo");
                     continue;
                 };
 
@@ -986,6 +1039,7 @@ async fn subscribe_sendqueue_forever(client: &Client, store: &AsyncProgramStore)
 
             RoomSendQueueUpdate::SendError { error, .. } => {
                 // XXX: Retry recoverable errors
+                tracing::warn!("error sending local echo: {error:?}");
                 locked.application.draw_error = Some(format!("Error sending message: {error}"));
             },
             RoomSendQueueUpdate::CancelledLocalEvent { transaction_id } => {
@@ -1039,7 +1093,9 @@ async fn load_space_children(client: &Client, store: &AsyncProgramStore) {
             let ev = match ev.deserialize() {
                 Ok(ev) => ev,
                 Err(e) => {
-                    tracing::warn!(room_id=?room.room_id(), "Unable to deserialize space child event: {e}");
+                    // A child that has been removed will have an invalid `m.space.child` event
+                    // (without a `via` field).
+                    tracing::trace!(room_id=?room.room_id(), "Unable to deserialize space child event: {e}");
                     continue;
                 },
             };
@@ -1147,7 +1203,6 @@ pub enum WorkerTask {
     ResolveAlias(OwnedRoomAliasId, ClientReply<IambResult<OwnedRoomId>>),
     JoinRoom(OwnedRoomOrAliasId, Vec<OwnedServerName>, ClientReply<IambResult<OwnedRoomId>>),
     CreateDM(OwnedUserId, ClientReply<IambResult<OwnedRoomId>>),
-    Members(OwnedRoomId, ClientReply<IambResult<Vec<RoomMember>>>),
     SpaceMembers(OwnedRoomId, ClientReply<IambResult<Vec<OwnedRoomId>>>),
     StartSync(ClientReply<IambResult<EditInfo>>),
     SaveTokens,
@@ -1199,12 +1254,6 @@ impl Debug for WorkerTask {
             WorkerTask::CreateDM(user_id, _) => {
                 f.debug_tuple("WorkerTask::CreateDM")
                     .field(user_id)
-                    .field(&format_args!("_"))
-                    .finish()
-            },
-            WorkerTask::Members(room_id, _) => {
-                f.debug_tuple("WorkerTask::Members")
-                    .field(room_id)
                     .field(&format_args!("_"))
                     .finish()
             },
@@ -1303,8 +1352,7 @@ async fn create_client_inner(
         builder.homeserver_url(url.as_str())
     } else {
         // Try to discover the homeserver from the user ID.
-        let account = &settings.profile;
-        builder.server_name(account.user_id.server_name())
+        builder.server_name(settings.user_id.server_name())
     };
 
     builder.build().await
@@ -1314,7 +1362,7 @@ pub async fn create_client(settings: &ApplicationSettings) -> Client {
     let account = &settings.profile;
     let res = match create_client_inner(&account.url, settings).await {
         Err(ClientBuildError::AutoDiscovery(_)) => {
-            let url = format!("https://{}/", account.user_id.server_name().as_str());
+            let url = format!("https://{}/", settings.user_id.server_name().as_str());
             let url = Url::parse(&url).unwrap();
             create_client_inner(&Some(url), settings).await
         },
@@ -1479,14 +1527,6 @@ impl Requester {
         return response.recv();
     }
 
-    pub fn members(&self, room_id: OwnedRoomId) -> IambResult<Vec<RoomMember>> {
-        let (reply, response) = oneshot();
-
-        self.tx.send(WorkerTask::Members(room_id, reply)).unwrap();
-
-        return response.recv();
-    }
-
     pub fn space_members(&self, space: OwnedRoomId) -> IambResult<Vec<OwnedRoomId>> {
         let (reply, response) = oneshot();
 
@@ -1608,10 +1648,6 @@ impl ClientWorker {
                 assert!(self.initialized);
                 reply.send(self.logout(user_id).await);
             },
-            WorkerTask::Members(room_id, reply) => {
-                assert!(self.initialized);
-                reply.send(self.members(room_id).await);
-            },
             WorkerTask::SpaceMembers(space, reply) => {
                 assert!(self.initialized);
                 reply.send(self.space_members(space).await);
@@ -1660,7 +1696,7 @@ impl ClientWorker {
                         .content
                         .user_ids
                         .into_iter()
-                        .filter(|u| u != &locked.application.settings.profile.user_id)
+                        .filter(|u| u != &locked.application.settings.user_id)
                         .collect();
 
                     locked.application.get_room_info(room_id).set_typing(users);
@@ -1849,10 +1885,12 @@ impl ClientWorker {
                     let event_id = ev.event_id().to_owned();
                     let _ = locked.application.presences.get_or_default(sender);
 
-                    let info = locked.application.rooms.get_or_default(room_id.to_owned());
+                    let ChatStore { rooms, settings, .. } = &mut locked.application;
+
+                    let info = rooms.get_or_default(room_id.to_owned());
 
                     let full_ev = ev.into_full_event(room_id.to_owned());
-                    info.insert_poll_start(full_ev);
+                    info.insert_poll_start(full_ev, &settings.user_id);
 
                     update_event_receipts(info, &room, event_id).await;
                 }
@@ -1872,10 +1910,12 @@ impl ClientWorker {
                     let event_id = ev.event_id().to_owned();
                     let _ = locked.application.presences.get_or_default(sender);
 
-                    let info = locked.application.rooms.get_or_default(room_id.to_owned());
+                    let ChatStore { rooms, settings, .. } = &mut locked.application;
+
+                    let info = rooms.get_or_default(room_id.to_owned());
 
                     let full_ev = ev.into_full_event(room_id.to_owned());
-                    info.insert_unstable_poll_start(full_ev);
+                    info.insert_unstable_poll_start(full_ev, &settings.user_id);
 
                     update_event_receipts(info, &room, event_id).await;
                 }
@@ -2170,7 +2210,7 @@ impl ClientWorker {
             LoginStyle::Password(password) => {
                 let mut login = client
                     .matrix_auth()
-                    .login_username(&self.settings.profile.user_id, &password)
+                    .login_username(&self.settings.user_id, &password)
                     .initial_device_display_name(initial_devname().as_str());
                 if let Some(device) = self.settings.read_saved_device() {
                     login = login.device_id(device.device_id().as_str());
@@ -2205,7 +2245,7 @@ impl ClientWorker {
             LoginStyle::OAuth => {
                 oauth_login(
                     self.client.clone(),
-                    &self.settings.profile.user_id,
+                    &self.settings.user_id,
                     self.settings.read_saved_device(),
                 )
                 .await?;
@@ -2222,7 +2262,7 @@ impl ClientWorker {
 
     async fn logout(&mut self, user_id: String) -> IambResult<EditInfo> {
         // Verify that the user is logging out of the correct profile.
-        let curr = self.settings.profile.user_id.as_str();
+        let curr = self.settings.user_id.as_str();
 
         if user_id != curr {
             let msg = format!("Incorrect user ID (currently logged in as {curr})");
@@ -2284,17 +2324,6 @@ impl ClientWorker {
 
                 return Err(err);
             },
-        }
-    }
-
-    async fn members(&mut self, room_id: OwnedRoomId) -> IambResult<Vec<RoomMember>> {
-        if let Some(room) = self.client.get_room(room_id.as_ref()) {
-            Ok(room
-                .members(RoomMemberships::ACTIVE | RoomMemberships::KNOCK)
-                .await
-                .map_err(IambError::from)?)
-        } else {
-            Err(IambError::UnknownRoom(room_id).into())
         }
     }
 
@@ -2398,12 +2427,12 @@ impl ClientWorker {
         };
 
         let msg = format!("* Successfully logged in with {}!", user);
-        if user != self.settings.profile.user_id {
+        if user != self.settings.user_id {
             // Trace warning if this happens
             tracing::warn!("logged in as a different user than expected");
-            self.settings.profile.user_id = user.to_owned();
+            self.settings.user_id = user.to_owned();
             let store = self.store.as_ref().expect("initialised worker should have store");
-            store.lock().await.application.settings.profile.user_id = user.to_owned();
+            store.lock().await.application.settings.user_id = user.to_owned();
         }
         Ok(Some(InfoMessage::from(msg)))
     }

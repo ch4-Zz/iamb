@@ -5,7 +5,7 @@
 .\"
 .\" You can preview this file with:
 .\"     $ man ./docs/iamb.5
-.Dd Sep 19, 2026
+.Dd Oct 21, 2026
 .Dt IAMB 5
 .Os
 .Sh NAME
@@ -34,6 +34,11 @@ It's structure and fields are described below.
 .Sh CONFIGURATION
 These options are sections at the top-level of the file.
 .Bl -tag -width Ds
+.It Sy include
+A list of additional toml configs to include. Paths are either absolute or
+relative to the config directory and support shell variable expansion. Configs
+specified later take precedence. If the path is a directory all files ending in
+".toml" are loaded. Transitive includes are not supported.
 .It Sy profiles
 A map of profile names containing per-account information.
 See
@@ -142,6 +147,13 @@ Specifying this object will replace the upstream defaults and possibly lead to u
 Possible keys and their effect are documented at:
 .br
 .Lk https://docs.rs/matrix-sdk/latest/matrix_sdk/media/struct.MediaRetentionPolicy.html#fields
+.It Sy date_format
+A strftime format string for the date separator between messages from different days.
+See
+.Lk https://docs.rs/chrono/latest/chrono/format/strftime/index.html
+for the conversion specifiers.
+Defaults to
+.Dq "%A, %B %d %Y" .
 .It Sy default_markup
 Controls how text in the message bar is interpreted by default.
 Possible values are
@@ -225,9 +237,12 @@ Possible values are:
 .Dq Sy trace ,
 .Dq Sy debug ,
 .Dq Sy info ,
-.Dq Sy warn
-(the default), and
-.Dq Sy error .
+.Dq Sy warn ,
+.Dq Sy error ,
+and
+.Dq Sy off
+(the default), which disables logging entirely.
+Note that this means no log files are written unless you adjust the level yourself.
 Also supports the syntax defined by
 .Lk https://docs.rs/tracing_subscriber/0.3.16/tracing_subscriber/filter/struct.EnvFilter.html
 .It Sy max_log_files
@@ -335,6 +350,11 @@ Show if this is a regular room, a DM or a space when the current window shows mu
 .It Sy unread
 Show if a non-muted, non-calmed room has unread messages or mentions.
 .El
+.It Sy rooms
+Overrides values for the specified room.
+See
+.Sx "ROOM OVERRIDES"
+for details on the format.
 .It Sy send_on_enter
 If
 .Sy true
@@ -361,6 +381,19 @@ Subsection for configuring how specific terminal features are used (or not used)
 See
 .Sx TERMINAL
 for more details.
+.It Sy time_format
+A strftime format string for the time shown beside each message.
+See
+.Lk https://docs.rs/chrono/latest/chrono/format/strftime/index.html
+for the conversion specifiers.
+The value is the full gutter text, including any brackets or spacing.
+Its display width, measured by rendering the format for a sample timestamp,
+is the width of the time column and does not change from message to message.
+An empty string disables the time display and reserves no columns.
+Defaults to
+.Dq "  [%T]" ,
+which renders as
+.Dq "  [HH:MM:SS]" .
 .It Sy typing_notice_send
 Defines whether or not the typing state is sent.
 .It Sy typing_notice_display
@@ -828,6 +861,8 @@ there are several subsections for specific UI areas:
 .Bl -tag -width Ds
 .It Sy default
 The base, default style that everything else should inherit.
+.It Sy selected
+Additional options for how to style selected items in lists and timelines.
 .It Sy cmdbar
 For controlling how the text in the command bar is styled.
 .Bl -tag -width Ds
@@ -945,7 +980,12 @@ and
 .Sy modifiers
 properties, you can also specify a
 .Sy colors
-array for providing a broad palette of colors from which to style usernames.
+field for providing a broad palette of colors from which to style usernames.
+You can provide an array of specific colors, which you may want if you have a list of specific colors that work for your theme, but you can also set it to
+.Sy "rainbow-light"
+or
+.Sy "rainbow-dark"
+to use a large light- or dark-colored rainbow palette for usernames.
 .Pp
 By default, this is a selection of 13 standard ANSI colors that should look okay on both light and dark backgrounds.
 You can set this array to
@@ -1032,6 +1072,23 @@ state.color = "cyan"
 [theme]
 tabs.title.modifiers = ["~bold", "italic"]
 windows.title.modifiers = ["~bold", "italic"]
+.Ed
+.Sh "ROOM OVERRIDES"
+The
+.Sy settings.rooms
+subsections allows overriding how specific rooms are displayed.
+Overrides are mapped onto Matrix Room IDs, Matrix Room Aliases, or User IDs for DMs.
+They are typically written as inline tables containing the following keys:
+.Bl -tag -width Ds
+.It Sy name
+Change the display name of the room.
+.El
+.Ss Example 1: Override how the iamb rooms appear in the room list
+.Bd -literal -offset indent
+[settings.rooms]
+"#iamb-users:0x.badd.cafe".name = "iamb user discussion"
+"!EpWjxfRMnoLQPCKZei:0x.badd.cafe".name = "iamb developers"
+"@ada:example.com".name = "My DM with Ada Lovelace"
 .Ed
 .Sh "USER OVERRIDES"
 The

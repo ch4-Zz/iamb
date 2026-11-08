@@ -7,6 +7,16 @@
 # If you want to start with something simple, use `config.example.toml` and add
 # things in one-by-one as you need them.
 # ==============================================================================
+
+# Include other config files
+include = [
+  # load `~/.config/iamb/config.d/*.toml` in lexicographic order
+  "config.d",
+
+  # override all local settings with values from a global config
+  "/etc/iamb/config.toml"
+]
+
 default_profile = "default"
 
 # Specify a user profile to log in as.
@@ -20,6 +30,9 @@ password_file = "/path/to/password"
 url = "https://matrix-client.matrix.org"
 
 [settings]
+# strftime format for the date separator. See
+# https://docs.rs/chrono/latest/chrono/format/strftime/index.html
+# date_format = "%A, %B %d %Y"
 default_markup = "markdown"
 default_register = "\""
 default_room = "#iamb-users:0x.badd.cafe"
@@ -39,6 +52,11 @@ read_receipt_send = true
 room_labels = ["membership", "muted", "tags"]
 request_timeout = 10000
 sync_delay_ms = 1000
+# strftime format for the per-message time gutter (same specifier reference as
+# date_format). This string is the full gutter text, including brackets and
+# spacing. Column width follows the rendered format. An empty string disables
+# the time display.
+# time_format = "  [%T]"
 typing_notice_display = true
 typing_notice_send = true
 user_gutter_width = 30
@@ -80,6 +98,11 @@ enable_title = true
 # Settings related to overriding how specific users are shown:
 [settings.users]
 "@user:matrix.org" = { "name" = "John Doe", "color" = "magenta" }
+
+# Settings to override room names
+[settings.rooms]
+"#room:matrix.org".name = "Some different room name"
+"@user:matrix.org".name = "My dm with John"
 
 # Specify a specific tab and window layout to use every time iamb starts:
 [layout]
